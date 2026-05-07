@@ -28,7 +28,9 @@ RUN cargo build --release -p testimony-client --bench recv_throughput
 # absolute size matters less than "big enough that the kernel doesn't
 # notice it caching" — but a couple hundred MB of varied frames
 # guarantees we measure receive throughput, not pcap-decode caching.
-RUN /work/target/release/gen_perf_pcap \
+# `/work/tests` is created by the COPY lines below in this Dockerfile,
+# but those run AFTER this RUN, so we mkdir -p it ourselves first.
+RUN mkdir -p /work/tests && /work/target/release/gen_perf_pcap \
         --count 1500000 \
         --size 100 \
         --out /work/tests/perf.pcap
