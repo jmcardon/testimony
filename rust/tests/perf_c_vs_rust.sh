@@ -187,6 +187,10 @@ run_one_pass() {
   DAEMON_PID=""
 
   # Extract the client's measured packet rate.
+  # Disable pipefail / -e locally so a no-match grep doesn't tear the
+  # whole script down — `pkts=0` is a valid (if alarming) result that
+  # the post-pass FAIL check handles separately.
+  set +eo pipefail
   local pkts=0
   local blocks=0
   local pps=0
@@ -194,7 +198,7 @@ run_one_pass() {
     rust)
       # The Rust client prints a single TESTCLIENT_RESULT line on graceful exit.
       local result_line
-      result_line=$(grep '^TESTCLIENT_RESULT' "$err_log" | tail -n 1)
+      result_line=$(grep '^TESTCLIENT_RESULT' "$err_log" 2>/dev/null | tail -n 1)
       if [ -n "$result_line" ]; then
         blocks=$(printf '%s\n' "$result_line" | sed -n 's/.*blocks=\([0-9]*\).*/\1/p')
         pkts=$(printf '%s\n' "$result_line" | sed -n 's/.*packets=\([0-9]*\).*/\1/p')
@@ -208,18 +212,24 @@ run_one_pass() {
       fi
       ;;
     c)
-      blocks=$(grep -c "^got block " "$err_log" || true)
+      blocks=$(grep -c "^got block " "$err_log" 2>/dev/null)
       pkts=$(awk '/^got block .* with / { sum += $5 } END { print sum+0 }' "$err_log")
       pps=$(awk -v p="$pkts" -v d="$DURATION" 'BEGIN { printf "%d", (p/d)+0.5 }')
       ;;
   esac
+  # Default to 0 if any of the parses bailed out empty.
+  blocks=${blocks:-0}
+  pkts=${pkts:-0}
+  pps=${pps:-0}
 
   # Pull tcpreplay's measured rate so we can detect generator-side
   # bottlenecking. Format from tcpreplay 4.x:
   #   "Actual: 1234567 packets ... (567890 pps)"
   local replay_pps
-  replay_pps=$(grep -oE '[0-9]+\.?[0-9]* pps' "$replay_log" | tail -n 1 | awk '{print $1}')
+  replay_pps=$(grep -oE '[0-9]+\.?[0-9]* pps' "$replay_log" 2>/dev/null | tail -n 1 | awk '{print $1}')
   replay_pps=${replay_pps:-0}
+  # Re-enable strict mode for the rest of the function.
+  set -eo pipefail
 
   local line
   line=$(printf "%-7s %-12s %10s blocks  %14s pkts  %12s pkt/s  (replay=%s pps)" \
@@ -254,18 +264,19 @@ echo "  duration=${DURATION}s  block_size=$BLOCK_SIZE  num_blocks=$NUM_BLOCKS"
 # Warm everything up FIRST: pcap into page cache, AF_PACKET slabs, BPF
 # JIT, tcpreplay binary, libtestimony in dyld cache. Without this the
 # first measured pass sees 30-50% lower numbers than the rest. We do
-# both kinds because each binary takes its own warmup.
+# both kinds because each binary takes its own warmup. Warmup failures
+# are tolerated (`|| true`) — only the measure passes are load-bearing.
 bold "Warmup pass (untimed for measurement, but takes ~${DURATION}s of wall clock)"
-run_one_pass rust warmup
-run_one_pass c warmup
+run_one_pass rust warmup || echo "  (warmup rust failed — continuing to measured passes anyway)"
+run_one_pass c warmup    || echo "  (warmup c failed — continuing to measured passes anyway)"
 
 # Three measured passes per client, alternating, so any drift between
 # kinds shows up as a per-pass difference rather than a systematic
 # advantage. Median is the headline number.
 bold "Measured passes (3 each, alternating)"
 for n in 1 2 3; do
-  run_one_pass rust "measure-$n"
-  run_one_pass c    "measure-$n"
+  run_one_pass rust "measure-$n" || echo "  (measure-$n rust failed — see logs)"
+  run_one_pass c    "measure-$n" || echo "  (measure-$n c failed — see logs)"
 done
 
 bold "FINAL SUMMARY"
