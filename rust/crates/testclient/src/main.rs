@@ -30,6 +30,11 @@ fn run() -> Result<(), String> {
     let mut fanout: u32 = 0;
     let mut count: i64 = -1;
     let mut dump = false;
+    // Perf-friendly mode: suppress per-block stderr lines that would
+    // otherwise dominate observable cost at multi-100k blocks/sec, and
+    // have the program print one summary line on graceful exit. Used
+    // by `rust/tests/perf_c_vs_rust.sh`.
+    let mut quiet = false;
 
     let args: Vec<String> = std::env::args().collect();
     let mut i = 1;
@@ -58,8 +63,11 @@ fn run() -> Result<(), String> {
                 count = v.parse().map_err(|e| format!("invalid --count: {e}"))?;
             }
             "--dump" => dump = true,
+            "--quiet" => quiet = true,
             "--help" | "-h" => {
-                eprintln!("Usage: testclient --socket PATH [--fanout N] [--count N] [--dump]");
+                eprintln!(
+                    "Usage: testclient --socket PATH [--fanout N] [--count N] [--dump] [--quiet]"
+                );
                 return Ok(());
             }
             s if s.starts_with("--socket=") => socket = Some(s["--socket=".len()..].into()),
@@ -88,65 +96,105 @@ fn run() -> Result<(), String> {
     let Some(socket) = socket else {
         return Err("--socket is required".into());
     };
-    eprintln!("connecting to {socket:?}");
+
+    // Install a SIGINT/SIGTERM watcher that flips a flag the main loop
+    // polls between blocks. On graceful exit (or after `--count` is
+    // hit), we print one machine-readable summary line. The perf script
+    // uses this instead of stderr-scraping per-block log lines.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let s = stop.clone();
+        // SAFETY: signal-hook installs a safe wrapper; we just flip the flag.
+        let mut signals = signal_hook::iterator::Signals::new([
+            signal_hook::consts::SIGTERM,
+            signal_hook::consts::SIGINT,
+        ])
+        .map_err(|e| format!("signal-hook init: {e}"))?;
+        std::thread::spawn(move || {
+            if signals.forever().next().is_some() {
+                s.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
+    if !quiet {
+        eprintln!("connecting to {socket:?}");
+    }
     let mut conn = Conn::connect(&socket).map_err(|e| format!("connect: {e}"))?;
-    eprintln!("setting fanout to {fanout}");
+    if !quiet {
+        eprintln!("setting fanout to {fanout}");
+    }
     conn.init(fanout).map_err(|e| format!("init: {e}"))?;
 
-    eprintln!("reading blocks");
+    if !quiet {
+        eprintln!("reading blocks");
+    }
     let mut total = 0i64;
-    let mut block_num = 0;
+    let mut block_num: u64 = 0;
     let start = Instant::now();
     'outer: loop {
-        eprintln!("getting block");
-        let Some(block) = conn
-            .next_block(None)
+        if stop.load(Ordering::Relaxed) {
+            break 'outer;
+        }
+        // Use a short timeout so we observe the stop flag between blocks
+        // even when the daemon is idle. 100 ms keeps shutdown latency low
+        // without spinning on poll.
+        let block = match conn
+            .next_block(Some(std::time::Duration::from_millis(100)))
             .map_err(|e| format!("get block: {e}"))?
-        else {
-            // Should be impossible with timeout = None, but loop again to be safe.
-            continue;
+        {
+            Some(b) => b,
+            None => continue, // timeout — recheck stop flag
         };
         block_num += 1;
         let mut block_count: i64 = 0;
         let mut hit_zero = false;
-        // Iterate packets in a short-lived scope so the iterator borrow ends
-        // before we consume `block` with `return_block()`.
-        {
-            for pkt in block.iter_packets() {
-                if count == 0 {
-                    hit_zero = true;
-                    break;
+        for pkt in block.iter_packets() {
+            if count == 0 {
+                hit_zero = true;
+                break;
+            }
+            count -= 1;
+            if dump {
+                let data = pkt.data();
+                let mut s = String::with_capacity(data.len() * 2);
+                for b in data {
+                    use std::fmt::Write as _;
+                    let _ = write!(s, "{b:02x}");
                 }
-                count -= 1;
-                if dump {
-                    let data = pkt.data();
-                    let mut s = String::with_capacity(data.len() * 2);
-                    for b in data {
-                        use std::fmt::Write as _;
-                        // Writing into a String never errors.
-                        let _ = write!(s, "{b:02x}");
-                    }
-                    println!("{s}");
-                }
-                block_count += 1;
-                if count == 0 {
-                    hit_zero = true;
-                    break;
-                }
+                println!("{s}");
+            }
+            block_count += 1;
+            if count == 0 {
+                hit_zero = true;
+                break;
             }
         }
-        eprintln!("returning block");
         block
             .return_block()
             .map_err(|e| format!("return block: {e}"))?;
         total = total.saturating_add(block_count);
-        eprintln!(
-            "block {block_num} had {block_count} packets, {total} total in {:?}",
-            start.elapsed()
-        );
+        if !quiet {
+            eprintln!(
+                "block {block_num} had {block_count} packets, {total} total in {:?}",
+                start.elapsed()
+            );
+        }
         if hit_zero {
             break 'outer;
         }
     }
+
+    let elapsed = start.elapsed();
+    // Final summary line. Always printed (quiet or not) so the perf
+    // harness has a single, easy-to-parse anchor: prefix "TESTCLIENT_RESULT"
+    // followed by space-separated key=value pairs.
+    eprintln!(
+        "TESTCLIENT_RESULT blocks={block_num} packets={total} elapsed_ns={ns} pkt_per_sec={pps:.0}",
+        ns = elapsed.as_nanos(),
+        pps = total as f64 / elapsed.as_secs_f64().max(1e-9),
+    );
     Ok(())
 }

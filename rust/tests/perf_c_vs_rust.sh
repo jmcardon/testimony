@@ -108,72 +108,77 @@ if [ ! -x "$C_CLIENT" ]; then
      -o "$C_CLIENT"
 fi
 
+# `run_one_pass kind tag` runs ONE measured pass and appends a result
+# line tagged `tag` to the summary. tag distinguishes warmup vs measure.
 run_one_pass() {
   local kind="$1"  # "rust" or "c"
-  local out_log="$LOGDIR/${kind}.out"
-  local err_log="$LOGDIR/${kind}.err"
-  : > "$out_log"; : > "$err_log"
+  local tag="$2"   # "warmup" or "measure-N"
+  local err_log="$LOGDIR/${kind}-${tag}.err"
+  local replay_log="$LOGDIR/tcpreplay_${kind}-${tag}.log"
+  local daemon_log="$LOGDIR/daemon_${kind}-${tag}.log"
+  : > "$err_log"; : > "$replay_log"; : > "$daemon_log"
 
-  bold "Starting daemon for $kind pass"
-  RUST_LOG=warn "$TARGET/testimonyd" --config="$CFG" > "$LOGDIR/daemon_${kind}.log" 2>&1 &
+  RUST_LOG=warn "$TARGET/testimonyd" --config="$CFG" > "$daemon_log" 2>&1 &
   DAEMON_PID=$!
+  local up=0
   for _ in $(seq 1 40); do
-    [ -S "$SOCK" ] && break
+    [ -S "$SOCK" ] && { up=1; break; }
     sleep 0.05
   done
-  if ! [ -S "$SOCK" ]; then
-    echo "FAIL: daemon didn't bring up socket"; exit 1
+  if [ "$up" -ne 1 ]; then
+    echo "FAIL: daemon didn't bring up socket for $kind/$tag"
+    cat "$daemon_log"
+    exit 1
   fi
 
-  # Spawn the client (run forever; we kill it after $DURATION).
+  # Spawn the client. Both clients run forever; we send SIGTERM at the
+  # end of the timed window so the Rust client can print its
+  # TESTCLIENT_RESULT summary line before exiting. The C legacy client
+  # has no such graceful path; we parse its existing per-block stderr.
   case "$kind" in
     rust)
-      "$TARGET/testclient" --socket="$SOCK" --count=-1 \
-        > "$out_log" 2> "$err_log" &
+      "$TARGET/testclient" --socket="$SOCK" --count=-1 --quiet \
+        > /dev/null 2> "$err_log" &
       ;;
     c)
-      # The C client takes --socket and --count; --count=0 means "exit
-      # on first pre-decrement to 0" which is "process forever" because
-      # post-decrement underflows below 0 only after billions of packets
-      # — fine for our 10-second window.
       "$C_CLIENT" --socket "$SOCK" --count 0 \
-        > "$out_log" 2> "$err_log" &
+        > /dev/null 2> "$err_log" &
       ;;
     *) echo "unknown kind"; exit 2;;
   esac
   CLIENT_PID=$!
 
-  # Wait for client to be in steady state.
-  sleep 0.5
+  # Let the client reach steady state before we start the timer.
+  sleep 0.3
 
-  # Replay packets in a tight loop forever (`--loop=0`); we kill it
-  # after the timed window. This ensures the receiver never starves on
-  # the input even if the pcap is small. With the 1.5M-packet
-  # synthesised pcap a single loop already takes ~1s at line rate; we
-  # loop anyway in case the host CPU is fast enough to drain a loop in
-  # < $DURATION seconds.
-  ( tcpreplay -i "$DUMMY" --topspeed --loop=0 "$PCAP" > "$LOGDIR/tcpreplay_${kind}.log" 2>&1 || true ) &
+  # Background replay loop. tcpreplay reports its own pps at exit; we
+  # capture that to detect when tcpreplay (not the client) is the
+  # bottleneck.
+  ( tcpreplay -i "$DUMMY" --topspeed --loop=0 "$PCAP" > "$replay_log" 2>&1 || true ) &
   REPLAY_PID=$!
 
-  # Timed window.
   sleep "$DURATION"
 
-  # Stop replay first, then client (so client drains tail).
+  # Stop the replay first so tcpreplay's stats are flushed, then signal
+  # the client (graceful — Rust client prints summary; C client just dies).
   kill "$REPLAY_PID" 2>/dev/null || true
   wait "$REPLAY_PID" 2>/dev/null || true
   REPLAY_PID=""
-  sleep 0.2
-
-  # Kill the client and capture its stats from stderr.
-  kill -INT "$CLIENT_PID" 2>/dev/null || true
-  sleep 0.2
+  sleep 0.1
+  # Graceful TERM gives the Rust client time to print its summary line.
+  kill -TERM "$CLIENT_PID" 2>/dev/null || true
+  # Wait up to 2s for graceful exit, then force-kill.
+  local i
+  for i in $(seq 1 40); do
+    kill -0 "$CLIENT_PID" 2>/dev/null || break
+    sleep 0.05
+  done
   kill -KILL "$CLIENT_PID" 2>/dev/null || true
   wait "$CLIENT_PID" 2>/dev/null || true
   CLIENT_PID=""
 
-  # Tear down the daemon (graceful so the next pass starts clean).
   kill -TERM "$DAEMON_PID" 2>/dev/null || true
-  for _ in $(seq 1 50); do
+  for i in $(seq 1 50); do
     kill -0 "$DAEMON_PID" 2>/dev/null || break
     sleep 0.1
   done
@@ -181,58 +186,106 @@ run_one_pass() {
   wait "$DAEMON_PID" 2>/dev/null || true
   DAEMON_PID=""
 
-  # Pull "block N had K packets, T total" lines from stderr (Rust) or
-  # "got block ... with K packets" (C). Sum the per-block counts.
+  # Extract the client's measured packet rate.
   local pkts=0
   local blocks=0
+  local pps=0
   case "$kind" in
     rust)
-      # Format: "block 12 had 1024 packets, 30000 total in 9.5s"
-      blocks=$(grep -c "^block " "$err_log" || true)
-      pkts=$(awk '/^block .* had / { sum += $4 } END { print sum+0 }' "$err_log")
+      # The Rust client prints a single TESTCLIENT_RESULT line on graceful exit.
+      local result_line
+      result_line=$(grep '^TESTCLIENT_RESULT' "$err_log" | tail -n 1)
+      if [ -n "$result_line" ]; then
+        blocks=$(printf '%s\n' "$result_line" | sed -n 's/.*blocks=\([0-9]*\).*/\1/p')
+        pkts=$(printf '%s\n' "$result_line" | sed -n 's/.*packets=\([0-9]*\).*/\1/p')
+        # Use the client's own elapsed-ns clock for pps so we don't
+        # confound with our shell-side sleep slop.
+        local ns
+        ns=$(printf '%s\n' "$result_line" | sed -n 's/.*elapsed_ns=\([0-9]*\).*/\1/p')
+        if [ -n "$ns" ] && [ "$ns" -gt 0 ]; then
+          pps=$(awk -v p="$pkts" -v n="$ns" 'BEGIN { printf "%d", (p*1e9/n)+0.5 }')
+        fi
+      fi
       ;;
     c)
-      # Format: "got block 0x... with 1024 packets"
       blocks=$(grep -c "^got block " "$err_log" || true)
       pkts=$(awk '/^got block .* with / { sum += $5 } END { print sum+0 }' "$err_log")
+      pps=$(awk -v p="$pkts" -v d="$DURATION" 'BEGIN { printf "%d", (p/d)+0.5 }')
       ;;
   esac
 
-  local pps_int=0
-  if [ "$DURATION" -gt 0 ]; then
-    pps_int=$(awk -v p="$pkts" -v d="$DURATION" 'BEGIN { printf "%d", (p/d)+0.5 }')
-  fi
+  # Pull tcpreplay's measured rate so we can detect generator-side
+  # bottlenecking. Format from tcpreplay 4.x:
+  #   "Actual: 1234567 packets ... (567890 pps)"
+  local replay_pps
+  replay_pps=$(grep -oE '[0-9]+\.?[0-9]* pps' "$replay_log" | tail -n 1 | awk '{print $1}')
+  replay_pps=${replay_pps:-0}
+
   local line
-  line=$(printf "%-9s %10d blocks  %14d pkts  %12d pkt/s  (%ds)" \
-    "$kind" "$blocks" "$pkts" "$pps_int" "$DURATION")
+  line=$(printf "%-7s %-12s %10s blocks  %14s pkts  %12s pkt/s  (replay=%s pps)" \
+    "$kind" "$tag" "$blocks" "$pkts" "$pps" "$replay_pps")
   echo "  $line"
   printf "%s\n" "$line" >> "$SUMMARY"
+  # Machine-readable line for the median extractor. One field per
+  # column, space-separated. Stored alongside the human summary so we
+  # don't have to re-parse the formatted version.
+  printf 'RESULT %s %s %s %s %s %s\n' \
+    "$kind" "$tag" "$blocks" "$pkts" "$pps" "$replay_pps" >> "$SUMMARY"
 
-  # Sanity: zero packets means setup broke (BPF filter, daemon, dummy
-  # interface, …). Surface it loudly instead of silently shipping a 0.
-  if [ "$pkts" -eq 0 ]; then
-    echo "FAIL: $kind pass measured 0 packets — see $LOGDIR/${kind}.err and $LOGDIR/daemon_${kind}.log"
+  if [ "${tag#warmup}" = "$tag" ] && [ "$pkts" -eq 0 ]; then
+    # Only fail on measure passes; warmups are allowed to be 0 if the
+    # very first kernel-level setup eats the whole window.
+    echo "FAIL: $kind/$tag measured 0 packets — see $err_log and $daemon_log"
     return 1
   fi
 }
 
 bold "PERF: Rust testclient vs C testclient_c"
-echo "  pcap=$PCAP  duration=${DURATION}s  block_size=$BLOCK_SIZE  num_blocks=$NUM_BLOCKS"
+echo "  pcap=$PCAP"
 echo "  pcap size: $(du -h "$PCAP" 2>/dev/null | cut -f1) ($(stat -c %s "$PCAP" 2>/dev/null || stat -f %z "$PCAP") bytes)"
+echo "  duration=${DURATION}s  block_size=$BLOCK_SIZE  num_blocks=$NUM_BLOCKS"
 {
   printf "PERF SUMMARY  pcap=%s  duration=%ds  block_size=%d  num_blocks=%d\n" \
     "$PCAP" "$DURATION" "$BLOCK_SIZE" "$NUM_BLOCKS"
-  printf "%-9s %10s  %14s  %12s\n" "kind" "blocks" "pkts" "pkt/s"
-  printf '%s\n' "------------------------------------------------------------------"
+  printf "%-7s %-12s %10s  %14s  %12s  %s\n" "kind" "tag" "blocks" "pkts" "pkt/s" "replay"
+  printf '%s\n' "----------------------------------------------------------------------------------------"
 } > "$SUMMARY"
 
-run_one_pass rust
-run_one_pass c
-bold "Re-running Rust pass to confirm reproducibility"
-run_one_pass rust
+# Warm everything up FIRST: pcap into page cache, AF_PACKET slabs, BPF
+# JIT, tcpreplay binary, libtestimony in dyld cache. Without this the
+# first measured pass sees 30-50% lower numbers than the rest. We do
+# both kinds because each binary takes its own warmup.
+bold "Warmup pass (untimed for measurement, but takes ~${DURATION}s of wall clock)"
+run_one_pass rust warmup
+run_one_pass c warmup
+
+# Three measured passes per client, alternating, so any drift between
+# kinds shows up as a per-pass difference rather than a systematic
+# advantage. Median is the headline number.
+bold "Measured passes (3 each, alternating)"
+for n in 1 2 3; do
+  run_one_pass rust "measure-$n"
+  run_one_pass c    "measure-$n"
+done
 
 bold "FINAL SUMMARY"
 echo "  log directory inside container: $LOGDIR"
 echo "  (mount it from the host with -v \$PWD/perf-logs:$LOGDIR to inspect)"
 echo
 cat "$SUMMARY"
+echo
+# Compute median pkt/s per kind for the headline. Reads the
+# `RESULT kind tag blocks pkts pps replay` machine-readable lines so
+# the parsing is robust against printf alignment changes.
+for kind in rust c; do
+  awk -v k="$kind" '
+    $1 == "RESULT" && $2 == k && $3 ~ /^measure-/ { print $6 }
+  ' "$SUMMARY" | sort -n | awk -v k="$kind" '
+    { a[NR] = $1 }
+    END {
+      if (NR == 0) { exit }
+      if (NR % 2) { med = a[int((NR+1)/2)] }
+      else        { med = (a[NR/2] + a[NR/2+1]) / 2 }
+      printf "  median pkt/s [%s] = %d (n=%d)\n", k, med, NR
+    }'
+done
