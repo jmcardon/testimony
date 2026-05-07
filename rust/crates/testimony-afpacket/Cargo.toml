@@ -1,0 +1,11 @@
+[package]
+name = "testimony-afpacket"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "AF_PACKET TPACKET_V3 ring binding for testimony"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+log.workspace = true

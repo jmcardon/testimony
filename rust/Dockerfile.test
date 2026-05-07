@@ -1,0 +1,37 @@
+# End-to-end test container for testimonyd.
+#
+# Uses an amd64 base so the prebuilt artifacts work on Apple Silicon hosts via
+# Docker Desktop's emulation. We compile the workspace inside the container so
+# we exercise the same toolchain everywhere.
+
+FROM --platform=linux/amd64 rust:1.89-bookworm
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ca-certificates \
+        iproute2 \
+        net-tools \
+        procps \
+        tcpdump \
+        tcpreplay \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /work
+# Copy workspace; build to a target dir we expose for caching.
+COPY Cargo.toml /work/Cargo.toml
+COPY crates /work/crates
+RUN cargo build --release
+
+# Bring in the integration assets too, so a single container can run them.
+COPY tests/run_e2e.sh /work/tests/run_e2e.sh
+COPY tests/test.pcap /work/tests/test.pcap
+COPY tests/c_abi_smoke.c /work/tests/c_abi_smoke.c
+RUN chmod +x /work/tests/run_e2e.sh
+
+# Pre-compile the C ABI smoke test against the just-built libtestimony.so.
+RUN cc /work/tests/c_abi_smoke.c \
+       -L /work/target/release -ltestimony \
+       -Wl,-rpath,/work/target/release \
+       -o /work/tests/c_abi_smoke
+
+ENTRYPOINT ["/work/tests/run_e2e.sh"]

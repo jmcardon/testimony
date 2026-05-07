@@ -1,26 +1,43 @@
-# Copyright 2015 Google Inc. All rights reserved.
+# Top-level Makefile.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# The original C + Go targets are kept under `legacy_*` for reference;
+# default targets now build the Rust workspace.
 
-all: go c
+CARGO ?= cargo
+RUST_DIR := rust
+TARGET ?=
 
-clean: go_clean c_clean
+CARGO_FLAGS := --manifest-path $(RUST_DIR)/Cargo.toml --release
+ifneq ($(TARGET),)
+CARGO_FLAGS += --target $(TARGET)
+endif
 
-install: go_install c_install
+.PHONY: all build test clean install \
+        legacy_all legacy_clean legacy_install legacy_test \
+        go go_test go_clean go_install \
+        c c_test c_clean c_install
 
-test: go_test c_test
+all: build
 
-.PHONY: c go
+build:
+	$(CARGO) build $(CARGO_FLAGS)
+
+test:
+	$(CARGO) test $(CARGO_FLAGS) --workspace
+
+clean:
+	$(CARGO) clean --manifest-path $(RUST_DIR)/Cargo.toml
+
+install: build
+	@./install.sh
+
+# ---------------------------------------------------------------------------
+# Legacy Go + C build targets, kept for the migration window.
+# ---------------------------------------------------------------------------
+legacy_all: go c
+legacy_clean: go_clean c_clean
+legacy_install: go_install c_install
+legacy_test: go_test c_test
 
 go:
 	$(MAKE) -C go

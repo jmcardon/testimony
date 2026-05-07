@@ -1,0 +1,24 @@
+[package]
+name = "testimonyd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Testimony AF_PACKET sharing daemon"
+
+[[bin]]
+name = "testimonyd"
+path = "src/main.rs"
+
+[dependencies]
+testimony-protocol.workspace = true
+testimony-afpacket.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+env_logger.workspace = true
+signal-hook = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+nix = { workspace = true }

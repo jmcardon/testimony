@@ -1,0 +1,10 @@
+[package]
+name = "testimony-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Wire protocol for the testimony AF_PACKET sharing daemon"
+
+[lints.rust]
+unsafe_code = "forbid"

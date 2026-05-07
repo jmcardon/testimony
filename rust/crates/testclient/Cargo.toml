@@ -1,0 +1,14 @@
+[package]
+name = "testclient"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Test client for testimonyd"
+
+[[bin]]
+name = "testclient"
+path = "src/main.rs"
+
+[dependencies]
+testimony-client.workspace = true
