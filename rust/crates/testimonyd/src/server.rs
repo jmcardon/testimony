@@ -101,12 +101,18 @@ impl FanoutSlot {
         clients.remove(&id);
     }
 
-    fn snapshot_clients(&self) -> Vec<ClientTx> {
+    /// Snapshot the current client set into a caller-owned `Vec`,
+    /// reusing its allocation. Called per-block from `dispatch_loop`,
+    /// so allocating a fresh Vec each call would be ~1 alloc per block
+    /// at multi-100k blocks/sec. The dispatcher passes in a buffer it
+    /// owns; we `clear()` then `extend` from the locked map.
+    fn snapshot_clients_into(&self, out: &mut Vec<ClientTx>) {
+        out.clear();
         let clients = match self.clients.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
-        clients.values().cloned().collect()
+        out.extend(clients.values().cloned());
     }
 }
 
@@ -191,8 +197,12 @@ impl Workers {
         // Tell every connected client writer to stop. Non-blocking: if the
         // inbox is full we don't care — the writer will see Shutdown next,
         // or exit when its peer reads/writes fail at socket teardown.
+        // Cleanup runs once per process shutdown, so allocating a fresh
+        // Vec here is fine (no hot-path concern).
+        let mut buf: Vec<ClientTx> = Vec::new();
         for slot in &self.slots {
-            for tx in slot.snapshot_clients() {
+            slot.snapshot_clients_into(&mut buf);
+            for tx in buf.drain(..) {
                 let _ = tx.try_send(WriterMsg::Shutdown);
             }
         }
@@ -474,6 +484,12 @@ fn dispatch_loop(slot: Arc<FanoutSlot>, shutdown: Shutdown) {
         return;
     }
     let mut idx: u32 = 0;
+    // Reusable client-snapshot buffer. The dispatcher hits this per
+    // block; allocating a fresh Vec each iteration would be ~1 alloc
+    // per block at multi-100k blocks/sec. Capacity is preserved across
+    // iterations via `Vec::clear` (inside `snapshot_clients_into`), so
+    // steady-state is zero allocations per block.
+    let mut clients_buf: Vec<ClientTx> = Vec::with_capacity(16);
     while !shutdown.is_set() {
         // Wait for this block to become ready.
         loop {
@@ -514,8 +530,8 @@ fn dispatch_loop(slot: Arc<FanoutSlot>, shutdown: Shutdown) {
             shutdown.set();
             return;
         };
-        let clients = slot.snapshot_clients();
-        for tx in clients {
+        slot.snapshot_clients_into(&mut clients_buf);
+        for tx in clients_buf.drain(..) {
             let Some(ticket) = BlockTicket::new(slot.sock.clone(), idx) else {
                 // The anchor proved idx is in range; if a fresh ticket
                 // can't be made, refcount overflowed — bail instead of
