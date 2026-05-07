@@ -63,6 +63,12 @@ cleanup() {
   [ -n "${DAEMON_PID:-}" ] && kill -KILL "$DAEMON_PID" 2>/dev/null
   [ -n "${REPLAY_PID:-}" ] && kill -KILL "$REPLAY_PID" 2>/dev/null
   [ -n "${CLIENT_PID:-}" ] && kill -KILL "$CLIENT_PID" 2>/dev/null
+  # Belt-and-suspenders: if any tcpreplay leaked (e.g. subshell wrapper
+  # bug, kill timing race), nuke it so the next run starts clean.
+  pkill -KILL -f "tcpreplay -i $DUMMY" 2>/dev/null
+  pkill -KILL -f "testimonyd --config=$CFG" 2>/dev/null
+  pkill -KILL -f "$TARGET/testclient" 2>/dev/null
+  pkill -KILL -f "$C_CLIENT" 2>/dev/null
   rm -f "$SOCK" "$CFG"
 }
 trap cleanup EXIT
@@ -151,17 +157,35 @@ run_one_pass() {
   # Let the client reach steady state before we start the timer.
   sleep 0.3
 
-  # Background replay loop. tcpreplay reports its own pps at exit; we
-  # capture that to detect when tcpreplay (not the client) is the
-  # bottleneck.
-  ( tcpreplay -i "$DUMMY" --topspeed --loop=0 "$PCAP" > "$replay_log" 2>&1 || true ) &
+  # Pre-flight: assert no other tcpreplay is already running. If one
+  # leaked from a previous pass (this happened with the old subshell-
+  # wrapped invocation that captured the wrong PID), the next pass
+  # would see double-rate input and report inflated numbers.
+  if pgrep -f "tcpreplay -i $DUMMY" > /dev/null 2>&1; then
+    echo "  WARN: a tcpreplay process is already running for $DUMMY — killing"
+    pkill -KILL -f "tcpreplay -i $DUMMY" 2>/dev/null || true
+    sleep 0.2
+  fi
+
+  # Run tcpreplay directly (no subshell wrapper) so $! is tcpreplay's
+  # actual PID, not a wrapper subshell's PID. The previous version had
+  # `( tcpreplay … ) &` which captured the subshell PID; killing the
+  # subshell left tcpreplay running and each subsequent pass added
+  # another spammer to the dummy interface.
+  tcpreplay -i "$DUMMY" --topspeed --loop=0 "$PCAP" > "$replay_log" 2>&1 &
   REPLAY_PID=$!
 
   sleep "$DURATION"
 
   # Stop the replay first so tcpreplay's stats are flushed, then signal
   # the client (graceful — Rust client prints summary; C client just dies).
-  kill "$REPLAY_PID" 2>/dev/null || true
+  # SIGTERM first; if it doesn't drop in 200ms, escalate.
+  kill -TERM "$REPLAY_PID" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$REPLAY_PID" 2>/dev/null || break
+    sleep 0.01
+  done
+  kill -KILL "$REPLAY_PID" 2>/dev/null || true
   wait "$REPLAY_PID" 2>/dev/null || true
   REPLAY_PID=""
   sleep 0.1
