@@ -23,6 +23,15 @@ COPY crates /work/crates
 RUN cargo build --release
 # Build the perf harness too so the E2E can run it.
 RUN cargo build --release -p testimony-client --bench recv_throughput
+# Synthesise a large (~150 MB) deterministic pcap for the throughput
+# benchmark. tcpreplay loops it forever during the timed window so the
+# absolute size matters less than "big enough that the kernel doesn't
+# notice it caching" — but a couple hundred MB of varied frames
+# guarantees we measure receive throughput, not pcap-decode caching.
+RUN /work/target/release/gen_perf_pcap \
+        --count 1500000 \
+        --size 100 \
+        --out /work/tests/perf.pcap
 
 # Bring in the integration assets too, so a single container can run them.
 COPY tests/run_e2e.sh /work/tests/run_e2e.sh

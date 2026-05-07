@@ -1,39 +1,60 @@
 #!/usr/bin/env bash
 # C client vs. Rust client end-to-end perf comparison.
 #
-# Both clients link against (or are) `libtestimony.so`. Each test:
+# Each pass:
 #   1. Boots a fresh testimonyd against a dummy interface.
-#   2. Starts ONE client in the background, pinned to a CPU.
-#   3. Replays test.pcap in a tight loop for $DURATION seconds.
-#   4. Counts how many packets each client processed.
-#   5. Reports packets/sec.
+#   2. Starts ONE client.
+#   3. Replays test.pcap forever (tcpreplay --loop=0) for $DURATION
+#      seconds, then kills the replay.
+#   4. Reads each client's reported per-block packet counts and sums.
+#   5. Prints packets/sec to stdout AND writes a summary file to LOGDIR.
 #
 # Run from inside the docker image:
 #   docker build --platform=linux/amd64 -f rust/Dockerfile.test -t testimony-perf rust/
 #   docker run --rm --platform=linux/amd64 \
 #       --cap-add=NET_ADMIN --cap-add=NET_RAW --cap-add=IPC_LOCK \
+#       -v "$PWD/perf-logs:/perf-logs" \
+#       -e LOGDIR=/perf-logs \
 #       --entrypoint /work/tests/perf_c_vs_rust.sh testimony-perf
 #
-# Knobs:
-#   DURATION (default 10) — seconds of replay per pass
-#   LOOPS    (default 50) — tcpreplay --loop count; tune so the run lasts
-#                            roughly DURATION seconds at line rate
-#   BLOCK_SIZE / NUM_BLOCKS — testimonyd ring sizing
+# Or use the wrapper which sets the volume mount for you:
+#   ./rust/tests/run_perf_compare.sh
+#
+# Knobs (env vars):
+#   DURATION   (default 15) — seconds of replay per pass
+#   BLOCK_SIZE (default 1048576) — testimonyd ring block size
+#   NUM_BLOCKS (default 16)      — testimonyd ring block count
+#   LOGDIR     (default /tmp/perf_logs) — where per-pass logs land
+#                                          (mount this from the host to
+#                                           inspect after `docker run --rm`)
 
 set -euo pipefail
 
 TARGET=${TARGET:-/work/target/release}
 DUMMY=${DUMMY:-dummy0}
-PCAP=${PCAP:-/work/tests/test.pcap}
-DURATION=${DURATION:-10}
-LOOPS=${LOOPS:-200}
+# Prefer the synthesised perf pcap (~150 MB, 1.5M packets); fall back to
+# the tiny golden-test pcap so this script still works on a host that
+# hasn't built the perf pcap yet (it will just be lower-throughput).
+if [ -z "${PCAP:-}" ]; then
+  if [ -f /work/tests/perf.pcap ]; then
+    PCAP=/work/tests/perf.pcap
+  else
+    PCAP=/work/tests/test.pcap
+  fi
+fi
+DURATION=${DURATION:-15}
 BLOCK_SIZE=${BLOCK_SIZE:-1048576}
 NUM_BLOCKS=${NUM_BLOCKS:-16}
 
+# Default to a host-mountable path so users see the logs after the
+# container is reaped. The wrapper script `run_perf_compare.sh` mounts
+# /perf-logs by default; if you run docker by hand, do the same.
+LOGDIR=${LOGDIR:-/tmp/perf_logs}
+SUMMARY="$LOGDIR/summary.txt"
 SOCK=/tmp/testimony_perf.sock
 CFG=/tmp/testimony_perf.json
-LOGDIR=/tmp/perf_logs
 mkdir -p "$LOGDIR"
+: > "$SUMMARY"
 
 bold() { printf "\n\e[1;36m=== %s ===\e[0m\n" "$*"; }
 
@@ -125,9 +146,13 @@ run_one_pass() {
   # Wait for client to be in steady state.
   sleep 0.5
 
-  # Replay packets in the background for DURATION seconds. tcpreplay's
-  # --duration matches what we want.
-  ( tcpreplay -i "$DUMMY" --topspeed --loop="$LOOPS" "$PCAP" > "$LOGDIR/tcpreplay_${kind}.log" 2>&1 || true ) &
+  # Replay packets in a tight loop forever (`--loop=0`); we kill it
+  # after the timed window. This ensures the receiver never starves on
+  # the input even if the pcap is small. With the 1.5M-packet
+  # synthesised pcap a single loop already takes ~1s at line rate; we
+  # loop anyway in case the host CPU is fast enough to drain a loop in
+  # < $DURATION seconds.
+  ( tcpreplay -i "$DUMMY" --topspeed --loop=0 "$PCAP" > "$LOGDIR/tcpreplay_${kind}.log" 2>&1 || true ) &
   REPLAY_PID=$!
 
   # Timed window.
@@ -173,15 +198,41 @@ run_one_pass() {
       ;;
   esac
 
-  echo "  $kind: $blocks blocks, $pkts packets in ${DURATION}s — \
-$(awk -v p="$pkts" -v d="$DURATION" 'BEGIN { printf "%.0f pkt/s\n", p/d }')"
+  local pps_int=0
+  if [ "$DURATION" -gt 0 ]; then
+    pps_int=$(awk -v p="$pkts" -v d="$DURATION" 'BEGIN { printf "%d", (p/d)+0.5 }')
+  fi
+  local line
+  line=$(printf "%-9s %10d blocks  %14d pkts  %12d pkt/s  (%ds)" \
+    "$kind" "$blocks" "$pkts" "$pps_int" "$DURATION")
+  echo "  $line"
+  printf "%s\n" "$line" >> "$SUMMARY"
+
+  # Sanity: zero packets means setup broke (BPF filter, daemon, dummy
+  # interface, …). Surface it loudly instead of silently shipping a 0.
+  if [ "$pkts" -eq 0 ]; then
+    echo "FAIL: $kind pass measured 0 packets — see $LOGDIR/${kind}.err and $LOGDIR/daemon_${kind}.log"
+    return 1
+  fi
 }
 
-bold "PERF: Rust testclient vs C testclient_c (DURATION=${DURATION}s, LOOPS=${LOOPS})"
+bold "PERF: Rust testclient vs C testclient_c"
+echo "  pcap=$PCAP  duration=${DURATION}s  block_size=$BLOCK_SIZE  num_blocks=$NUM_BLOCKS"
+echo "  pcap size: $(du -h "$PCAP" 2>/dev/null | cut -f1) ($(stat -c %s "$PCAP" 2>/dev/null || stat -f %z "$PCAP") bytes)"
+{
+  printf "PERF SUMMARY  pcap=%s  duration=%ds  block_size=%d  num_blocks=%d\n" \
+    "$PCAP" "$DURATION" "$BLOCK_SIZE" "$NUM_BLOCKS"
+  printf "%-9s %10s  %14s  %12s\n" "kind" "blocks" "pkts" "pkt/s"
+  printf '%s\n' "------------------------------------------------------------------"
+} > "$SUMMARY"
+
 run_one_pass rust
 run_one_pass c
-
 bold "Re-running Rust pass to confirm reproducibility"
 run_one_pass rust
 
-bold "DONE — full logs in $LOGDIR"
+bold "FINAL SUMMARY"
+echo "  log directory inside container: $LOGDIR"
+echo "  (mount it from the host with -v \$PWD/perf-logs:$LOGDIR to inspect)"
+echo
+cat "$SUMMARY"
