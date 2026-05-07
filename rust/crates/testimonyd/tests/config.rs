@@ -2,8 +2,8 @@
 //! `integration_test/test.sh` actually deserializes with the same field
 //! names the daemon expects. A serde rename typo would fail this test.
 
+// No `deny_unknown_fields`: the Go daemon accepts unknown fields, so we do too.
 #[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
 struct SC {
     #[serde(rename = "SocketName")]
     _socket_name: String,

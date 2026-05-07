@@ -125,19 +125,29 @@ pub enum WriterMsg {
 
 /// Reader thread: parses incoming u32-or-TLV from the client and forwards
 /// either Returned(i) or PeerClosed to the writer.
+///
+/// Hot-path: every block-return from a client is exactly 4 bytes. The
+/// reader does one `read(2)` per return — trying to buffer here would
+/// be wasted work because clients return blocks at most as fast as the
+/// dispatcher emits them, and the kernel's socket buffer already
+/// coalesces small writes. Drain TLV payloads into a reusable scratch
+/// buffer so the rare unsolicited-TLV path doesn't allocate.
 pub fn reader_loop(
     mut stream: UnixStream,
     num_blocks: u32,
     tx: mpsc::SyncSender<WriterMsg>,
     shutdown: Shutdown,
 ) {
-    let mut buf = [0u8; 4];
+    // Reusable scratch buffer for draining unknown-TLV payloads. Sized
+    // generously so a 64 KB malicious TLV reuses the same allocation.
+    let mut drain_buf = [0u8; 4096];
+    let mut hdr = [0u8; 4];
     loop {
         if shutdown.is_set() {
             let _ = tx.send(WriterMsg::PeerClosed);
             return;
         }
-        if let Err(e) = read_exact_or_eof(&mut stream, &mut buf) {
+        if let Err(e) = read_exact_or_eof(&mut stream, &mut hdr) {
             match e {
                 ReadErr::Eof => log::debug!("client EOF"),
                 ReadErr::Io(io) => log::debug!("reader io error: {io}"),
@@ -145,8 +155,8 @@ pub fn reader_loop(
             let _ = tx.send(WriterMsg::PeerClosed);
             return;
         }
-        let raw = u32::from_be_bytes(buf);
-        // Bare block-index has the high bit unset.
+        let raw = u32::from_be_bytes(hdr);
+        // Bare block-index has the high bit unset — fast path.
         if raw & 0x8000_0000 == 0 {
             let i = raw;
             if i >= num_blocks {
@@ -159,22 +169,24 @@ pub fn reader_loop(
             }
             continue;
         }
-        // TLV from client → must be ClientToServer category.
+        // TLV from client. Match `socket.go:223-237`: log a warning if the
+        // type isn't ClientToServer but DON'T drop the connection — the
+        // legacy Go daemon just logs at vlog.V(1) and continues. The bytes
+        // are still drained from the wire so the next read aligns.
         let (typ, length) = proto::tl_from(raw);
         if proto::category_of(typ) != Category::ClientToServer {
             log::warn!("reader got bad client→server type {typ:#x}");
-            let _ = tx.send(WriterMsg::PeerClosed);
-            return;
         }
-        // Drain the value bytes; the daemon ignores all client-originated TLVs
-        // by design (matches the Go implementation).
-        if length > 0 {
-            let mut payload = vec![0u8; length as usize];
-            if let Err(e) = read_exact_or_eof(&mut stream, &mut payload) {
+        // Drain the payload in chunks reusing `drain_buf` — never allocates.
+        let mut remaining = length as usize;
+        while remaining > 0 {
+            let chunk = remaining.min(drain_buf.len());
+            if let Err(e) = read_exact_or_eof(&mut stream, &mut drain_buf[..chunk]) {
                 log::debug!("reader payload error: {e:?}");
                 let _ = tx.send(WriterMsg::PeerClosed);
                 return;
             }
+            remaining -= chunk;
         }
         log::info!("ignoring client TLV type={typ:#x} len={length}");
     }
@@ -194,21 +206,14 @@ impl std::fmt::Display for ReadErr {
     }
 }
 
+/// Read until `buf` is full or the peer closes. `read < buf.len()` is
+/// the loop invariant, so direct slice indexing is statically in bounds
+/// — no defensive `get_mut` branch on the hot path.
 fn read_exact_or_eof(s: &mut UnixStream, buf: &mut [u8]) -> Result<(), ReadErr> {
     let total = buf.len();
     let mut read = 0;
     while read < total {
-        // Use slice::get_mut so an unforeseen logic bug surfaces as a typed
-        // error rather than a panic. `read < total` keeps this branch live.
-        let dst = match buf.get_mut(read..) {
-            Some(d) => d,
-            None => {
-                return Err(ReadErr::Io(std::io::Error::other(format!(
-                    "read_exact_or_eof: get_mut({read}..) returned None on len={total}"
-                ))));
-            }
-        };
-        match s.read(dst) {
+        match s.read(&mut buf[read..]) {
             Ok(0) => return Err(ReadErr::Eof),
             Ok(n) => read += n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -221,9 +226,16 @@ fn read_exact_or_eof(s: &mut UnixStream, buf: &mut [u8]) -> Result<(), ReadErr> 
 /// Writer thread: drains the inbox, holds all in-flight `BlockTicket`s,
 /// performs batched writes of block-indices to the client.
 ///
-/// Batching matches Go: when one `NewBlock` arrives, opportunistically
-/// drain any others already waiting and pack them into a single `write_all`
-/// — this collapses N `write()` syscalls into 1 under load.
+/// Batching matches Go (`socket.go:266 conn.run`): when one `NewBlock`
+/// arrives, opportunistically drain any others already waiting and pack
+/// them into a single `write_all` — this collapses N `write()` syscalls
+/// into 1 under load.
+///
+/// Performance: the batch buffer is allocated **once** per writer (one
+/// per client), sized to `num_blocks * 4` bytes, and `clear()`ed between
+/// flushes so the allocation is reused for the lifetime of the connection.
+/// At a 1M-block/s workload across 100 clients this saves ~1M allocator
+/// round-trips per second vs. allocating-per-batch.
 pub fn writer_loop(
     mut stream: UnixStream,
     num_blocks: u32,
@@ -233,15 +245,17 @@ pub fn writer_loop(
     // One slot per block: `Some((ticket, sent_at))` while in flight.
     let mut outstanding: Vec<Option<(BlockTicket, Instant)>> =
         (0..num_blocks).map(|_| None).collect();
+    // Per-connection batch buffer, reused across every flush. Cap at
+    // `num_blocks * 4` so we never grow past one ring's worth of indices
+    // (the dispatcher couldn't have produced more without first getting
+    // a Returned that frees a slot). `saturating_mul` guards against a
+    // hostile `num_blocks` that slipped past config validation.
+    let cap = (num_blocks as usize).saturating_mul(4);
+    let mut batch_buf: Vec<u8> = Vec::with_capacity(cap);
 
     'outer: while let Ok(first) = rx.recv() {
         match first {
             WriterMsg::NewBlock(ticket) => {
-                // Cap at u16::MAX bytes (~16k indices) just in case a hostile
-                // num_blocks slipped past validation; saturating_mul keeps us
-                // out of debug-mode panic territory.
-                let cap = (num_blocks as usize).saturating_mul(4);
-                let mut batch_buf: Vec<u8> = Vec::with_capacity(cap);
                 let mut current = Some(ticket);
                 while let Some(t) = current {
                     let idx = t.index();
@@ -268,8 +282,8 @@ pub fn writer_loop(
                                 log::debug!("writer send failed: {e}");
                                 break 'outer;
                             }
-                            // Clear the batch so the post-loop flush doesn't
-                            // double-send what we already wrote here.
+                            // Clear (keep the allocation) so the post-loop
+                            // flush doesn't double-send what we already wrote.
                             batch_buf.clear();
                             // Re-handle `other` synchronously to avoid losing it.
                             if !handle_non_newblock(other, &mut outstanding) {
@@ -277,8 +291,9 @@ pub fn writer_loop(
                             }
                             current = None;
                         }
-                        Err(mpsc::TryRecvError::Empty) => current = None,
-                        Err(mpsc::TryRecvError::Disconnected) => current = None,
+                        Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => {
+                            current = None;
+                        }
                     }
                 }
                 if !batch_buf.is_empty() {
@@ -286,6 +301,7 @@ pub fn writer_loop(
                         log::debug!("writer send failed: {e}");
                         break 'outer;
                     }
+                    batch_buf.clear();
                 }
             }
             other => {
@@ -537,5 +553,204 @@ mod tests {
         let idx_b = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
         assert_eq!(idx_a, 2);
         assert_eq!(idx_b, 5);
+    }
+
+    /// Match `socket.go:223-226`: an unknown TLV type from the client is
+    /// logged and IGNORED — Go does not drop the connection over a bad
+    /// type. Rust must match: payload drained, loop continues.
+    #[test]
+    fn reader_loop_ignores_unknown_tlv_then_continues() {
+        use std::io::Write;
+        use testimony_protocol::{to_tl, TYPE_FANOUT_INDEX};
+        let (peer_a, mut peer_b) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = mpsc::sync_channel::<WriterMsg>(4);
+        let shutdown = Shutdown::new();
+
+        // Send a ServerToClient-category TLV (which is the wrong direction
+        // from the client) with a 4-byte payload, then a legit block return.
+        // The Go daemon would log the bad type but keep going, draining the
+        // payload and processing the next message.
+        let tl = to_tl(testimony_protocol::TYPE_FANOUT_SIZE, 4).to_be_bytes();
+        peer_b.write_all(&tl).expect("tl");
+        peer_b.write_all(&[0x00, 0x00, 0x00, 0x99]).expect("payload");
+        // Now a valid client-side TLV (FanoutIndex) with 4-byte payload —
+        // Go drains and ignores; Rust must too.
+        let tl2 = to_tl(TYPE_FANOUT_INDEX, 4).to_be_bytes();
+        peer_b.write_all(&tl2).expect("tl2");
+        peer_b.write_all(&[0x00, 0x00, 0x00, 0x01]).expect("payload2");
+        // And finally a real block-index return.
+        peer_b.write_all(&3u32.to_be_bytes()).expect("blockidx");
+        drop(peer_b);
+
+        let h = std::thread::spawn(move || {
+            reader_loop(peer_a, 16, tx, shutdown);
+        });
+        h.join().expect("reader thread");
+
+        // Expect: Returned(3), then PeerClosed (no Returned-from-bad-TLV).
+        let msg1 = rx.try_recv().expect("first message");
+        assert!(
+            matches!(msg1, WriterMsg::Returned(3)),
+            "expected Returned(3) after draining bad+good TLVs, got something else"
+        );
+        let msg2 = rx.try_recv().expect("second message");
+        assert!(matches!(msg2, WriterMsg::PeerClosed));
+    }
+
+    /// TLV with length > 0 and short payload (peer closes mid-payload) →
+    /// reader emits PeerClosed without panicking.
+    #[test]
+    fn reader_loop_truncated_tlv_payload_emits_peer_closed() {
+        use std::io::Write;
+        use testimony_protocol::{to_tl, TYPE_FANOUT_INDEX};
+        let (peer_a, mut peer_b) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = mpsc::sync_channel::<WriterMsg>(4);
+        let shutdown = Shutdown::new();
+
+        let tl = to_tl(TYPE_FANOUT_INDEX, 4).to_be_bytes();
+        peer_b.write_all(&tl).expect("tl");
+        // Only write 2 of the 4 payload bytes, then close.
+        peer_b.write_all(&[0xDE, 0xAD]).expect("partial");
+        drop(peer_b);
+
+        let h = std::thread::spawn(move || {
+            reader_loop(peer_a, 16, tx, shutdown);
+        });
+        h.join().expect("reader thread");
+        let msg = rx.try_recv().expect("message");
+        assert!(matches!(msg, WriterMsg::PeerClosed));
+    }
+
+    /// Reader observes shutdown flag set BEFORE first read → emits
+    /// PeerClosed promptly. Mirrors the "daemon shutting down before any
+    /// client traffic" scenario.
+    #[test]
+    fn reader_loop_observes_shutdown_promptly() {
+        let (peer_a, _peer_b) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = mpsc::sync_channel::<WriterMsg>(4);
+        let shutdown = Shutdown::new();
+        shutdown.set(); // pre-flip
+
+        let h = std::thread::spawn(move || {
+            reader_loop(peer_a, 16, tx, shutdown);
+        });
+        // Reader should exit promptly once it observes the flag at the top
+        // of its loop. Bound the join with a generous timeout — we use
+        // a separate channel since std doesn't have join-with-timeout.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            h.join().expect("reader thread");
+            let _ = done_tx.send(());
+        });
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("reader didn't exit on shutdown flag");
+        // Reader sent PeerClosed before exiting.
+        let msg = rx.try_recv().expect("PeerClosed");
+        assert!(matches!(msg, WriterMsg::PeerClosed));
+    }
+
+    /// Multiple Returned messages for unique outstanding blocks: each
+    /// transitions slot back to None and decrements (we can't observe
+    /// refcount without tickets, but we CAN observe the writer doesn't
+    /// exit prematurely as long as slots are populated by NewBlock).
+    /// This is the off-Linux variant; the real refcount test is the
+    /// Linux-gated `writer_loop_does_not_double_flush_on_interleaved_messages`.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn writer_loop_handles_multiple_returns_in_order() {
+        use crate::conn::ticket::BlockTicket;
+        use std::io::Read;
+        let (peer_a, mut peer_b) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = mpsc::sync_channel::<WriterMsg>(16);
+        let shutdown = Shutdown::new();
+
+        tx.send(WriterMsg::NewBlock(BlockTicket::for_test(0)))
+            .expect("nb0");
+        tx.send(WriterMsg::NewBlock(BlockTicket::for_test(1)))
+            .expect("nb1");
+        tx.send(WriterMsg::NewBlock(BlockTicket::for_test(2)))
+            .expect("nb2");
+        tx.send(WriterMsg::Returned(0)).expect("r0");
+        tx.send(WriterMsg::Returned(1)).expect("r1");
+        tx.send(WriterMsg::Returned(2)).expect("r2");
+        tx.send(WriterMsg::PeerClosed).expect("close");
+        drop(tx);
+
+        let h = std::thread::spawn(move || {
+            writer_loop(peer_a, 16, rx, shutdown);
+        });
+        h.join().expect("writer thread");
+
+        // Peer should have seen 3 indices (12 bytes).
+        let mut buf = [0u8; 32];
+        let n = peer_b.read(&mut buf).unwrap_or(0);
+        assert_eq!(n, 12, "expected 12 bytes, got {n}");
+        for (i, expected) in [0u32, 1, 2].iter().enumerate() {
+            let off = i * 4;
+            let v = u32::from_be_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+            assert_eq!(v, *expected);
+        }
+    }
+
+    /// The dispatcher is supposed to never give the writer the same block
+    /// twice while it's outstanding. If it ever does, the writer logs and
+    /// exits — match the legacy Go behaviour at `socket.go:275`
+    /// (`log.Fatalf("received already outstanding block...")`) but
+    /// gracefully. This test verifies the writer doesn't write garbage
+    /// when given a duplicate.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn writer_loop_duplicate_outstanding_block_exits_without_writing_garbage() {
+        use crate::conn::ticket::BlockTicket;
+        use std::io::Read;
+        let (peer_a, mut peer_b) = UnixStream::pair().expect("socketpair");
+        let (tx, rx) = mpsc::sync_channel::<WriterMsg>(8);
+        let shutdown = Shutdown::new();
+
+        tx.send(WriterMsg::NewBlock(BlockTicket::for_test(3)))
+            .expect("nb3");
+        // Same index again WITHOUT a Returned in between.
+        tx.send(WriterMsg::NewBlock(BlockTicket::for_test(3)))
+            .expect("nb3 dup");
+        drop(tx);
+
+        let h = std::thread::spawn(move || {
+            writer_loop(peer_a, 16, rx, shutdown);
+        });
+        h.join().expect("writer thread");
+
+        let mut buf = [0u8; 32];
+        let n = peer_b.read(&mut buf).unwrap_or(0);
+        // The first NewBlock(3) was buffered. When the duplicate arrived
+        // via try_recv, we noticed slot.is_some() and bailed without
+        // flushing the batch. So the peer sees zero bytes (the buffered
+        // index never got written before we hit the error).
+        // Actually — re-read the writer_loop: in the inner `while let
+        // Some(t) = current` loop, the first NewBlock fills slot[3]; the
+        // try_recv pulls another NewBlock(3); current = Some(next); loop
+        // top sees slot.is_some() → break 'outer. The batch_buf has 4
+        // bytes for the first idx but never got flushed because we broke
+        // before the post-loop flush. So 0 bytes.
+        assert_eq!(n, 0, "expected no bytes (duplicate triggers bail), got {n}");
+    }
+
+    /// `WriterMsg::Shutdown` and `WriterMsg::PeerClosed` produce identical
+    /// effects: the writer exits without writing. They're intentionally
+    /// distinguishable for documentation purposes.
+    #[test]
+    fn writer_loop_shutdown_msg_is_indistinguishable_from_peer_closed() {
+        for msg in [WriterMsg::Shutdown, WriterMsg::PeerClosed] {
+            let (peer_a, mut peer_b) = UnixStream::pair().expect("socketpair");
+            let (tx, rx) = mpsc::sync_channel::<WriterMsg>(2);
+            let shutdown = Shutdown::new();
+            tx.send(msg).expect("send");
+            drop(tx);
+            let h = std::thread::spawn(move || writer_loop(peer_a, 4, rx, shutdown));
+            h.join().expect("writer");
+            let mut buf = [0u8; 8];
+            let n = peer_b.read(&mut buf).unwrap_or(0);
+            assert_eq!(n, 0);
+        }
     }
 }

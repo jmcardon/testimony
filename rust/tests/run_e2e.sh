@@ -195,8 +195,11 @@ REPLAY_PID=$!
 # Run the C ABI smoke against a real socket: phase 1 (negative connect),
 # phase 2 (wrap the 4-block ring at least 2× → 8 distinct block-deliveries
 # per index), phase 3 (return_packets). With the B1 regression intact this
-# would fail in phase 2 with -EPROTO somewhere around block 5.
-if ! /work/tests/c_abi_smoke --socket="$SOCK_C" --wraps=2; then
+# would fail in phase 2 with -EIO somewhere around block 5.
+#
+# IMPORTANT: c_abi_smoke.c parses --socket and --wraps as space-separated
+# (argp-style), not --key=value. Pass them as separate tokens.
+if ! /work/tests/c_abi_smoke --socket "$SOCK_C" --wraps 2; then
   echo "FAIL: C ABI multi-block test"
   kill "$REPLAY_PID" 2>/dev/null || true
   kill -TERM "$DAEMON_PID" 2>/dev/null || true
@@ -375,5 +378,119 @@ fi
 rm -f "$CFG2"
 rm -rf "$LOG2_DIR"
 
-bold "SUCCESS — $CLIENTS clients + fanout=2 test, daemon shut down cleanly"
+bold "Golden-output parity test (matches legacy integration_test/test.sh)"
+# The Go-era integration test cracks 10 testclients open against a
+# BPF-filtered socket, replays test.pcap *exactly once* at topspeed, and
+# asserts that every client's --dump output is byte-identical to
+# test.expected. This pins down:
+#   - tp_mac / snaplen / tp_next_offset packet slicing
+#   - block layout (every client sees the same blocks)
+#   - that the BPF filter actually filters (test.pcap has 10 packets;
+#     all match the host filter, so 10 lines per client)
+#   - that --count=10 exits the client cleanly mid-block if the count
+#     is hit before the block is exhausted
+SOCK_GOLD=/tmp/testimony_gold.sock
+CFG_GOLD=/tmp/testimony_gold.json
+LOG_GOLD=/tmp/daemon_gold.log
+LOG_GOLD_DIR=/tmp/clients_gold
+EXPECTED=/work/tests/test.expected
+
+# Sanity: golden file present in the image.
+if [ ! -f "$EXPECTED" ]; then
+  echo "FAIL: golden output $EXPECTED missing from image"
+  exit 1
+fi
+
+mkdir -p "$LOG_GOLD_DIR"
+cat > "$CFG_GOLD" <<EOF
+[
+  {
+      "SocketName": "$SOCK_GOLD"
+    , "Interface": "$DUMMY"
+    , "BlockSize": 1048576
+    , "NumBlocks": 16
+    , "BlockTimeoutMillis": 1000
+    , "FanoutSize": 1
+    , "User": "$(whoami)"
+    , "Filter": "host 169.254.1.1 and host 169.254.1.2"
+  }
+]
+EOF
+RUST_LOG=info "$TARGET/testimonyd" --config="$CFG_GOLD" > "$LOG_GOLD" 2>&1 &
+DAEMON_PID=$!
+sleep 1
+if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+  echo "FAIL: golden daemon didn't start"
+  cat "$LOG_GOLD"
+  exit 1
+fi
+
+# Spawn 10 parallel clients exactly like integration_test/test.sh.
+GOLD_PIDS=""
+for i in $(seq 1 10); do
+  "$TARGET/testclient" --socket="$SOCK_GOLD" --dump --count=10 \
+    > "$LOG_GOLD_DIR/out$i" 2> "$LOG_GOLD_DIR/err$i" &
+  GOLD_PIDS="$GOLD_PIDS $!"
+done
+sleep 1
+
+# Replay exactly once (no --loop), at topspeed.
+tcpreplay -i "$DUMMY" --topspeed "$PCAP"
+sleep 2
+
+# Wait for clients (they exit after --count=10 packets).
+for pid in $GOLD_PIDS; do
+  wait "$pid" 2>/dev/null || true
+done
+
+# Byte-for-byte assertion against the legacy golden output.
+GOLD_FAIL=0
+for i in $(seq 1 10); do
+  if ! diff -q "$LOG_GOLD_DIR/out$i" "$EXPECTED" > /dev/null 2>&1; then
+    echo "FAIL: client $i output diverges from $EXPECTED"
+    diff -u "$EXPECTED" "$LOG_GOLD_DIR/out$i" | head -40
+    echo "--- client $i stderr ---"
+    cat "$LOG_GOLD_DIR/err$i"
+    GOLD_FAIL=$((GOLD_FAIL + 1))
+  fi
+done
+if [ "$GOLD_FAIL" -gt 0 ]; then
+  echo "FAIL: $GOLD_FAIL/10 clients had non-matching output"
+  cat "$LOG_GOLD"
+  kill -KILL "$DAEMON_PID" 2>/dev/null || true
+  exit 1
+fi
+echo "OK: 10/10 clients produced byte-identical golden output"
+
+# Tear down the golden daemon cleanly.
+kill -TERM "$DAEMON_PID"
+for _ in $(seq 1 50); do
+  kill -0 "$DAEMON_PID" 2>/dev/null || break
+  sleep 0.1
+done
+kill -KILL "$DAEMON_PID" 2>/dev/null || true
+DAEMON_PID=""
+rm -f "$CFG_GOLD"
+rm -rf "$LOG_GOLD_DIR"
+if [ -e "$SOCK_GOLD" ]; then
+  echo "FAIL: golden sock $SOCK_GOLD still present after shutdown"
+  exit 1
+fi
+
+bold "Recv-throughput microbench (buffered vs unbuffered)"
+# Find the bench binary cargo emitted; the suffix is a content hash.
+BENCH=$(ls -1 /work/target/release/deps/recv_throughput-* 2>/dev/null | grep -v '\.d$' | head -n1)
+if [ -n "$BENCH" ] && [ -x "$BENCH" ]; then
+  "$BENCH"
+else
+  echo "(recv_throughput bench binary not found; skipping)"
+fi
+
+bold "Random-shutdown stress: kill daemon at random points (TERM/INT/KILL)"
+# Cleanup any stale state from previous tests.
+rm -f /tmp/testimony_chaos.sock /tmp/testimony_chaos.json
+TARGET="$TARGET" DUMMY="$DUMMY" PCAP="$PCAP" ITERATIONS=15 \
+  /work/tests/random_shutdown.sh
+
+bold "SUCCESS — $CLIENTS clients + fanout=2 + random-shutdown stress, daemon shut down cleanly"
 exit 0

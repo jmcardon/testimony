@@ -104,3 +104,69 @@ fn install_signal_watcher(s: Shutdown) -> Result<(), DaemonError> {
         })?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn shutdown_starts_unset() {
+        let s = Shutdown::new();
+        assert!(!s.is_set());
+    }
+
+    #[test]
+    fn shutdown_set_is_observable() {
+        let s = Shutdown::new();
+        s.set();
+        assert!(s.is_set());
+    }
+
+    #[test]
+    fn shutdown_set_is_idempotent() {
+        let s = Shutdown::new();
+        s.set();
+        s.set();
+        s.set();
+        assert!(s.is_set());
+    }
+
+    /// Cloned Shutdown shares state — flipping one observed by the other.
+    /// This is what makes the dispatcher / accept_loop / writer threads
+    /// agree on shutdown.
+    #[test]
+    fn shutdown_clones_share_state() {
+        let s1 = Shutdown::new();
+        let s2 = s1.clone();
+        assert!(!s2.is_set());
+        s1.set();
+        assert!(s2.is_set());
+    }
+
+    /// Many threads polling is_set() while one sets — every observer
+    /// eventually sees true. SeqCst ordering is what guarantees this.
+    #[test]
+    fn shutdown_visible_across_threads() {
+        let s = Shutdown::new();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let total: usize = 8;
+        let mut handles = Vec::with_capacity(total);
+        for _ in 0..total {
+            let s_clone = s.clone();
+            let obs = observed.clone();
+            handles.push(std::thread::spawn(move || {
+                while !s_clone.is_set() {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                obs.fetch_add(1, Ordering::SeqCst);
+            }));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        s.set();
+        for h in handles {
+            h.join().expect("observer");
+        }
+        assert_eq!(observed.load(Ordering::SeqCst), total);
+    }
+}

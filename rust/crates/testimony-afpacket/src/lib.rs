@@ -204,3 +204,136 @@ mod stub {
 
 #[cfg(not(target_os = "linux"))]
 pub use stub::*;
+
+#[cfg(test)]
+mod error_display_tests {
+    use super::*;
+
+    /// Operator-facing log lines for setup errors must mention the syscall
+    /// name and the relevant arguments, so a misconfigured deploy can be
+    /// debugged from the daemon log alone.
+    #[test]
+    fn afpacket_error_messages_are_diagnostic() {
+        let cases: Vec<(AfpacketError, &[&str])> = vec![
+            (
+                AfpacketError::SocketCreate(io::Error::from_raw_os_error(13)),
+                &["socket(AF_PACKET", "SOCK_RAW"],
+            ),
+            (
+                AfpacketError::Setsockopt {
+                    name: "PACKET_VERSION",
+                    source: io::Error::from_raw_os_error(22),
+                },
+                &["setsockopt", "PACKET_VERSION"],
+            ),
+            (
+                AfpacketError::MmapRing {
+                    len: 16_777_216,
+                    source: io::Error::from_raw_os_error(12),
+                },
+                &["mmap", "16777216"],
+            ),
+            (
+                AfpacketError::Bind {
+                    iface: "eth0".into(),
+                    ifindex: 2,
+                    source: io::Error::from_raw_os_error(13),
+                },
+                &["bind", "eth0", "ifindex=2"],
+            ),
+            (
+                AfpacketError::InterfaceNotFound {
+                    iface: "noexist0".into(),
+                    source: io::Error::from_raw_os_error(19),
+                },
+                &["if_nametoindex", "noexist0"],
+            ),
+            (
+                AfpacketError::InterfaceNameInvalid {
+                    iface: "with\0nul".into(),
+                },
+                &["NUL"],
+            ),
+            (
+                AfpacketError::RingSizeOverflow {
+                    block_size: u32::MAX,
+                    num_blocks: u32::MAX,
+                },
+                &["overflows usize"],
+            ),
+            (AfpacketError::BpfTooLarge(70_000), &["70000", "65535"]),
+            (
+                AfpacketError::BpfCompile {
+                    iface: "em1".into(),
+                    filter: "tcp port 22".into(),
+                    reason: "tcpdump exited with status 1: syntax error".into(),
+                },
+                &["em1", "tcp port 22", "syntax error"],
+            ),
+            (
+                AfpacketError::BpfCompileSpawn {
+                    tcpdump: PathBuf::from("/missing/tcpdump"),
+                    source: io::Error::from_raw_os_error(2),
+                },
+                &["/missing/tcpdump"],
+            ),
+            (
+                AfpacketError::Stats(io::Error::from_raw_os_error(13)),
+                &["PACKET_STATISTICS"],
+            ),
+            (
+                AfpacketError::Poll(io::Error::from_raw_os_error(4)),
+                &["poll on AF_PACKET"],
+            ),
+            (
+                AfpacketError::BlockIndexOutOfRange { idx: 99, num_blocks: 16 },
+                &["99", "16"],
+            ),
+        ];
+        for (err, expected) in cases {
+            let s = format!("{err}");
+            for needle in expected {
+                assert!(s.contains(needle), "{s:?} missing {needle:?}");
+            }
+        }
+    }
+
+    /// `Error::source()` returns Some for variants that wrap an io::Error.
+    #[test]
+    fn afpacket_error_source_chain() {
+        let e = AfpacketError::SocketCreate(io::Error::from_raw_os_error(1));
+        assert!(std::error::Error::source(&e).is_some());
+        let e = AfpacketError::InterfaceNameInvalid {
+            iface: "x".into(),
+        };
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    /// Stub `compile_bpf` on non-Linux returns a structured error.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn stub_compile_bpf_errors() {
+        let err = compile_bpf("eth0", "tcp").expect_err("non-linux must err");
+        assert!(matches!(err, AfpacketError::BpfCompile { .. }));
+    }
+
+    /// Stub `CaptureSocket::new` on non-Linux returns a structured error.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn stub_capture_socket_errors() {
+        let cfg = CaptureConfig {
+            iface: "eth0".into(),
+            block_size: 1024,
+            num_blocks: 1,
+            block_timeout_ms: 100,
+            fanout_id: 0,
+            fanout_size: 1,
+            fanout_type: 0,
+            bpf_filter: None,
+        };
+        match CaptureSocket::new(&cfg) {
+            Ok(_) => panic!("non-linux stub must error"),
+            Err(e) => assert!(matches!(e, AfpacketError::SocketCreate(_))),
+        }
+    }
+}

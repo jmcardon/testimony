@@ -21,17 +21,37 @@ WORKDIR /work
 COPY Cargo.toml /work/Cargo.toml
 COPY crates /work/crates
 RUN cargo build --release
+# Build the perf harness too so the E2E can run it.
+RUN cargo build --release -p testimony-client --bench recv_throughput
 
 # Bring in the integration assets too, so a single container can run them.
 COPY tests/run_e2e.sh /work/tests/run_e2e.sh
+COPY tests/random_shutdown.sh /work/tests/random_shutdown.sh
+COPY tests/perf_c_vs_rust.sh /work/tests/perf_c_vs_rust.sh
 COPY tests/test.pcap /work/tests/test.pcap
 COPY tests/c_abi_smoke.c /work/tests/c_abi_smoke.c
-RUN chmod +x /work/tests/run_e2e.sh
+# Byte-for-byte golden output kept in sync with `integration_test/test.expected`
+# (a copy lives in this build context too because Docker COPY can't escape).
+# This is the Go-era assertion that proves packet-data slicing matches the
+# legacy daemon — catches off-by-one in tp_mac, snaplen, or PacketIter.
+COPY tests/test.expected /work/tests/test.expected
+# Vendored C sources for the perf comparison: the legacy C client is the
+# baseline we're benchmarking the Rust port against. Kept in
+# rust/tests/c/ because Docker COPY can't escape the build context — the
+# canonical source is c/ at the repo root.
+COPY tests/c /work/c
+RUN chmod +x /work/tests/run_e2e.sh /work/tests/random_shutdown.sh /work/tests/perf_c_vs_rust.sh
 
 # Pre-compile the C ABI smoke test against the just-built libtestimony.so.
 RUN cc /work/tests/c_abi_smoke.c \
        -L /work/target/release -ltestimony \
        -Wl,-rpath,/work/target/release \
        -o /work/tests/c_abi_smoke
+# Pre-compile the C testclient (used by perf_c_vs_rust.sh).
+RUN cc -O2 /work/c/testimony_client.c \
+       -I /work/c \
+       -L /work/target/release -ltestimony \
+       -Wl,-rpath,/work/target/release \
+       -o /tmp/testimony_c_client
 
 ENTRYPOINT ["/work/tests/run_e2e.sh"]

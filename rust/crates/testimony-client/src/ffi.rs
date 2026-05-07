@@ -51,7 +51,16 @@ struct Inner {
 pub type testimony = *mut testimony_internal;
 
 /// Map every typed `Error` to a stable errno-style integer. The C ABI
-/// promises `-errno`; we honour that. Detail goes in errbuf via `set_err`.
+/// promises `-errno`; we honour that.
+///
+/// The mapping is kept bug-for-bug compatible with `c/testimony.c` so
+/// existing C clients' `switch (errno)` blocks keep matching the same
+/// branches. In particular:
+///   - missing handshake fields → `EINVAL` (`testimony.c:280`)
+///   - already-initialised → `EINVAL` (`testimony.c:297`)
+///   - bad block index from server → `EIO` (`testimony.c:393`)
+///   - peer hung up mid-recv → `ECANCELED` (`testimony.c:96`)
+///   - bad protocol version → `EPROTONOSUPPORT` (`testimony.c:236`)
 fn err_neg(e: &Error) -> c_int {
     match e {
         Error::Connect { source, .. }
@@ -61,14 +70,22 @@ fn err_neg(e: &Error) -> c_int {
         Error::Poll(io) | Error::RecvFd(io) => -(io.raw_os_error().unwrap_or(libc::EIO)),
         Error::PeerClosed { .. } => -libc::ECANCELED,
         Error::UnexpectedVersion { .. } => -libc::EPROTONOSUPPORT,
+        // `BlockIndexOutOfRange` is the same condition as `testimony.c:393`
+        // (server sent an index >= block_nr); the legacy lib returns EIO.
+        Error::BlockIndexOutOfRange { .. } => -libc::EIO,
+        // `MissingHandshakeFields` matches the legacy "didn't get fanout
+        // size and block size/nr" path at `testimony.c:280`, which sets
+        // EINVAL before goto fail.
+        Error::MissingHandshakeFields { .. } => -libc::EINVAL,
         Error::UnexpectedTlvCategory { .. }
         | Error::UnexpectedTlvLength { .. }
-        | Error::MissingHandshakeFields { .. }
-        | Error::BlockIndexOutOfRange { .. }
         | Error::NoFdInCmsg
         | Error::RecvFdBytes { .. } => -libc::EPROTO,
         Error::RingSizeOverflow { .. } => -libc::EOVERFLOW,
-        Error::AlreadyInitialized => -libc::EALREADY,
+        // Legacy `testimony_init` (`testimony.c:297`) returns EINVAL when
+        // called twice; preserve that exact errno even though EALREADY
+        // would be more descriptive.
+        Error::AlreadyInitialized => -libc::EINVAL,
         Error::NotInitialized => -libc::EINVAL,
         Error::Timeout => -libc::ETIMEDOUT,
         Error::InvalidSocketName(_) => -libc::EINVAL,
@@ -239,8 +256,10 @@ pub unsafe extern "C" fn testimony_get_block(
             // back to the C caller, who'll call testimony_return_block /
             // testimony_return_packets later.
             std::mem::forget(block);
-            // No `Conn::block_counts` to poison anymore (audit B1).
             // Stash the kernel-reported packet count for return_packets.
+            // Match `testimony.c:401`'s CAS: the slot must be 0 here. If
+            // it isn't, the daemon re-emitted a block we still hold —
+            // legacy behaviour returns -EIO so we do too.
             let Some(slot) = inner.counts.get(idx as usize) else {
                 set_err_str(
                     t,
@@ -251,7 +270,15 @@ pub unsafe extern "C" fn testimony_get_block(
                 );
                 return -libc::EIO;
             };
-            slot.store(np, Ordering::SeqCst);
+            if let Err(old) = slot.compare_exchange(0, np, Ordering::SeqCst, Ordering::SeqCst) {
+                set_err_str(
+                    t,
+                    &format!(
+                        "block count CAS failed for block {idx}, current count {old} != 0"
+                    ),
+                );
+                return -libc::EIO;
+            }
             *out_block = raw.cast();
             0
         }
@@ -307,7 +334,26 @@ pub unsafe extern "C" fn testimony_return_block(
         );
         return -libc::EIO;
     };
-    slot.store(0, Ordering::SeqCst);
+    // Match `testimony.c:434`: atomically swap the count to 0 and verify
+    // the old value was either 0 (return called twice or never started
+    // counting) or exactly num_pkts (return_packets never called). Any
+    // other value means return_block and return_packets were both called
+    // on the same block — the legacy lib returns -EINVAL.
+    let old_count = slot.swap(0, Ordering::SeqCst);
+    if old_count != 0 {
+        // SAFETY: `block` is a non-null pointer that block_index_of just
+        // proved lies inside our mmap'd ring at a valid block boundary.
+        // num_pkts is at offset 12 (version+offset_to_priv+block_status).
+        let num_pkts = std::ptr::read_unaligned(block.cast::<u8>().add(12) as *const u32);
+        if old_count != num_pkts {
+            set_err_str(
+                t,
+                "block count invalid... maybe testimony_return_block and \
+                 testimony_return_packet were both called?",
+            );
+            return -libc::EINVAL;
+        }
+    }
     match inner.conn.return_block_index_pub(idx) {
         Ok(()) => 0,
         Err(e) => {
@@ -472,4 +518,216 @@ pub unsafe extern "C" fn testimony_packet_nanos(pkt: *const c_void) -> i64 {
     let tp_sec = ptr::read_unaligned(p.add(4) as *const u32);
     let tp_nsec = ptr::read_unaligned(p.add(8) as *const u32);
     (tp_sec as i64) * 1_000_000_000 + (tp_nsec as i64)
+}
+
+#[cfg(test)]
+mod ffi_tests {
+    //! Pure-Rust tests of the C-ABI surface. These do NOT exercise a real
+    //! testimonyd — they verify the errno-mapping table matches the bytes
+    //! the legacy C library would have returned, and the null-pointer
+    //! safety wrappers behave.
+
+    use super::*;
+    use std::ffi::CString;
+
+    /// Errno mapping must match `c/testimony.c` bug-for-bug. A C client
+    /// switching on `errno == EALREADY` would never have hit that branch
+    /// against the legacy lib (which uses EINVAL); preserve that.
+    #[test]
+    fn err_neg_matches_legacy_c_lib() {
+        let cases: &[(Error, c_int)] = &[
+            // testimony.c:96 — EOF mid-recv → ECANCELED.
+            (Error::PeerClosed { stage: "x" }, -libc::ECANCELED),
+            // testimony.c:236 — bad version → EPROTONOSUPPORT.
+            (
+                Error::UnexpectedVersion { got: 9, want: 2 },
+                -libc::EPROTONOSUPPORT,
+            ),
+            // testimony.c:280 — missing handshake fields → EINVAL.
+            (
+                Error::MissingHandshakeFields {
+                    fanout_size: 0,
+                    block_size: 0,
+                    num_blocks: 0,
+                },
+                -libc::EINVAL,
+            ),
+            // testimony.c:297 — already initialised → EINVAL.
+            (Error::AlreadyInitialized, -libc::EINVAL),
+            // testimony.c:359 — not initialised → EINVAL.
+            (Error::NotInitialized, -libc::EINVAL),
+            // testimony.c:393 — server sent OOR block index → EIO.
+            (
+                Error::BlockIndexOutOfRange {
+                    idx: 99,
+                    num_blocks: 16,
+                },
+                -libc::EIO,
+            ),
+            // overflow on usize math → EOVERFLOW (no exact legacy match;
+            // closest legacy behaviour is EINVAL but the Rust port gets
+            // a more specific code, and it doesn't break legacy switches
+            // because legacy code never produced this scenario).
+            (
+                Error::RingSizeOverflow {
+                    block_size: u32::MAX,
+                    num_blocks: u32::MAX,
+                },
+                -libc::EOVERFLOW,
+            ),
+            // Protocol-shape errors (TLV cat, length, fd-cmsg) → EPROTO.
+            (
+                Error::UnexpectedTlvCategory {
+                    typ: 0x8001,
+                    length: 0,
+                },
+                -libc::EPROTO,
+            ),
+            (
+                Error::UnexpectedTlvLength {
+                    typ: 0x8003,
+                    got_length: 8,
+                    want_length: 4,
+                },
+                -libc::EPROTO,
+            ),
+            (Error::NoFdInCmsg, -libc::EPROTO),
+            (Error::RecvFdBytes { got: 0, want: 1 }, -libc::EPROTO),
+            (Error::Timeout, -libc::ETIMEDOUT),
+            (Error::InvalidSocketName("x".into()), -libc::EINVAL),
+            (Error::Internal("x".into()), -libc::EIO),
+        ];
+        for (err, expected) in cases {
+            let got = err_neg(err);
+            assert_eq!(got, *expected, "err_neg({err:?}) = {got}, want {expected}");
+        }
+    }
+
+    /// `testimony_close(NULL)` must not segfault and returns -EINVAL.
+    /// The legacy C lib at `testimony.c:332` blindly dereferences (so
+    /// passing NULL crashed). Rust's defensive null-check is an
+    /// improvement we keep.
+    #[test]
+    fn testimony_close_null_returns_einval() {
+        let r = unsafe { testimony_close(ptr::null_mut()) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_conn(NULL)` returns NULL — must not deref.
+    #[test]
+    fn testimony_conn_null_returns_null() {
+        let p = unsafe { testimony_conn(ptr::null_mut()) };
+        assert!(p.is_null());
+    }
+
+    /// `testimony_error(NULL)` returns NULL — matches Rust safety, even
+    /// though legacy `testimony.c:472` would deref (bug there).
+    #[test]
+    fn testimony_error_null_returns_null() {
+        let p = unsafe { testimony_error(ptr::null_mut()) };
+        assert!(p.is_null());
+    }
+
+    /// `testimony_init(NULL)` → -EINVAL.
+    #[test]
+    fn testimony_init_null_returns_einval() {
+        let r = unsafe { testimony_init(ptr::null_mut()) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_get_block(NULL, …)` → -EINVAL.
+    #[test]
+    fn testimony_get_block_null_returns_einval() {
+        let mut block: *const c_void = ptr::null();
+        let r = unsafe { testimony_get_block(ptr::null_mut(), 0, &mut block) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_return_block(NULL, …)` → -EINVAL.
+    #[test]
+    fn testimony_return_block_null_returns_einval() {
+        let r = unsafe { testimony_return_block(ptr::null_mut(), ptr::null()) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_return_packets(NULL, …)` → -EINVAL.
+    #[test]
+    fn testimony_return_packets_null_returns_einval() {
+        let r = unsafe { testimony_return_packets(ptr::null_mut(), ptr::null(), 1) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_iter_init(NULL)` → -EINVAL.
+    #[test]
+    fn testimony_iter_init_null_returns_einval() {
+        let r = unsafe { testimony_iter_init(ptr::null_mut()) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_iter_close(NULL)` → -EINVAL.
+    #[test]
+    fn testimony_iter_close_null_returns_einval() {
+        let r = unsafe { testimony_iter_close(ptr::null_mut()) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_iter_next(NULL)` → NULL pointer.
+    #[test]
+    fn testimony_iter_next_null_returns_null() {
+        let p = unsafe { testimony_iter_next(ptr::null_mut()) };
+        assert!(p.is_null());
+    }
+
+    /// `testimony_packet_data(NULL)` → NULL.
+    #[test]
+    fn testimony_packet_data_null_returns_null() {
+        let p = unsafe { testimony_packet_data(ptr::null()) };
+        assert!(p.is_null());
+    }
+
+    /// `testimony_packet_nanos(NULL)` → 0.
+    #[test]
+    fn testimony_packet_nanos_null_returns_zero() {
+        let n = unsafe { testimony_packet_nanos(ptr::null()) };
+        assert_eq!(n, 0);
+    }
+
+    /// Iter init then close round-trip without leaking.
+    #[test]
+    fn testimony_iter_init_close_round_trip() {
+        let mut iter: testimony_iter = ptr::null_mut();
+        let r = unsafe { testimony_iter_init(&mut iter) };
+        assert_eq!(r, 0);
+        assert!(!iter.is_null());
+        let r = unsafe { testimony_iter_close(iter) };
+        assert_eq!(r, 0);
+    }
+
+    /// `testimony_connect` against an obviously-bogus path returns a
+    /// negative errno. The exact errno depends on libc (ENOENT or
+    /// ECONNREFUSED), but it must be < 0.
+    #[test]
+    fn testimony_connect_bogus_path_negative_errno() {
+        let mut t: testimony = ptr::null_mut();
+        let bogus = CString::new("/tmp/_testimony_test_does_not_exist_xx").unwrap();
+        let r = unsafe { testimony_connect(&mut t, bogus.as_ptr()) };
+        assert!(r < 0, "expected negative errno, got {r}");
+        assert!(t.is_null(), "no handle should be returned on failure");
+    }
+
+    /// `testimony_connect` with NULL out-pointer → -EINVAL without crash.
+    #[test]
+    fn testimony_connect_null_out_returns_einval() {
+        let bogus = CString::new("/tmp/x").unwrap();
+        let r = unsafe { testimony_connect(ptr::null_mut(), bogus.as_ptr()) };
+        assert_eq!(r, -libc::EINVAL);
+    }
+
+    /// `testimony_connect` with NULL socket name → -EINVAL.
+    #[test]
+    fn testimony_connect_null_name_returns_einval() {
+        let mut t: testimony = ptr::null_mut();
+        let r = unsafe { testimony_connect(&mut t, ptr::null()) };
+        assert_eq!(r, -libc::EINVAL);
+    }
 }

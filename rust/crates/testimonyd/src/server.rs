@@ -794,6 +794,15 @@ fn send_tlv_empty(s: &mut UnixStream, typ: u16) -> std::io::Result<()> {
     std::io::Write::write_all(s, &proto::to_tl(typ, 0).to_be_bytes())
 }
 
+/// `cmsghdr` requires `size_t` alignment on Linux. A bare `[u8; N]`
+/// has 1-byte alignment, so we wrap it in a `repr(C)` union with a
+/// `cmsghdr` placeholder — same trick `nix` and `tokio-uds` use.
+#[repr(C)]
+union AlignedCmsgBuf {
+    _align: libc::cmsghdr,
+    bytes: [u8; cmsg_space::<libc::c_int>()],
+}
+
 fn send_fd(s: &UnixStream, fd: std::os::fd::RawFd) -> Result<(), DaemonError> {
     use std::os::fd::AsRawFd as _;
 
@@ -802,16 +811,22 @@ fn send_fd(s: &UnixStream, fd: std::os::fd::RawFd) -> Result<(), DaemonError> {
         iov_base: dummy.as_ptr() as *mut _,
         iov_len: 1,
     };
-    let mut cmsg_buf = [0u8; cmsg_space::<libc::c_int>()];
+    // Properly-aligned cmsg buffer.
+    let mut cmsg_buf = AlignedCmsgBuf {
+        bytes: [0u8; cmsg_space::<libc::c_int>()],
+    };
     // SAFETY: msghdr is plain old data; zero-init is valid.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_buf.as_mut_ptr().cast();
-    msg.msg_controllen = cmsg_buf.len() as _;
+    // SAFETY: bytes is the same allocation as the union; aligned to cmsghdr
+    // through `_align`. Buffer outlives the `sendmsg` call below.
+    msg.msg_control = unsafe { cmsg_buf.bytes.as_mut_ptr() }.cast();
+    msg.msg_controllen = unsafe { cmsg_buf.bytes.len() } as _;
 
     // Fill in cmsg header by hand (CMSG_FIRSTHDR + CMSG_DATA equivalents).
-    // SAFETY: cmsg_buf is sized for exactly one int via cmsg_space::<i32>().
+    // SAFETY: cmsg_buf is sized for exactly one int via `cmsg_space::<i32>()`
+    // and aligned for cmsghdr access via the union.
     unsafe {
         let cmsg = libc::CMSG_FIRSTHDR(&msg);
         if cmsg.is_null() {
@@ -820,13 +835,15 @@ fn send_fd(s: &UnixStream, fd: std::os::fd::RawFd) -> Result<(), DaemonError> {
         (*cmsg).cmsg_level = libc::SOL_SOCKET;
         (*cmsg).cmsg_type = libc::SCM_RIGHTS;
         (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as _;
+        // CMSG_DATA's natural alignment is platform-dependent; use
+        // write_unaligned to stay sound on stricter ABIs.
         let data_ptr = libc::CMSG_DATA(cmsg).cast::<libc::c_int>();
-        std::ptr::write(data_ptr, fd);
+        std::ptr::write_unaligned(data_ptr, fd);
     }
 
     // Retry on EINTR so a stray signal doesn't drop the handshake.
     loop {
-        // SAFETY: msg is fully initialized above.
+        // SAFETY: msg is fully initialized above; iov + cmsg_buf outlive the call.
         let n = unsafe { libc::sendmsg(s.as_raw_fd(), &msg, 0) };
         if n >= 0 {
             return Ok(());

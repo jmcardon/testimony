@@ -188,4 +188,65 @@ mod tests {
         assert!(msg.contains("eth0"), "expected iface in {msg}");
         assert!(msg.contains("tcp port 80"), "expected filter in {msg}");
     }
+
+    /// Newlines and tabs are valid whitespace separators (mirrors Go's
+    /// `bufio.ScanWords`).
+    #[test]
+    fn parse_handles_mixed_whitespace() {
+        let bpfs = ok("2\t6\t0\t0\t65535\n6\t0  0\t0");
+        assert_eq!(bpfs.len(), 2);
+    }
+
+    /// Header value larger than fits multiplied by 4 + 1 in usize → error.
+    /// On 64-bit usize this is unreachable in practice; we just exercise
+    /// the safety guard.
+    #[test]
+    fn parse_oversized_header_count_errors() {
+        // Choose a number large enough that count*4+1 still fits in i64 but
+        // we still want to validate length math. With usize being at least
+        // 32 bits, count = 1<<31 wouldn't fit count*4+1 in u32 — but this
+        // is i64 internally so we'd just hit the "expected_len" mismatch.
+        let huge = format!("{}\n", i64::MAX);
+        assert!(parse_tcpdump_ddd(&huge).is_err());
+    }
+
+    /// Body len not divisible by 4 → caught by header validation.
+    #[test]
+    fn parse_unaligned_body_errors() {
+        // header says 1 instruction, body has 5 ints — mismatch.
+        let err = parse_tcpdump_ddd("1\n6 0 0 0 0").expect_err("len mismatch");
+        let msg = err.to_string();
+        assert!(msg.contains("expected"), "expected explanation in {msg}");
+    }
+
+    /// Negative ints in body are valid (tcpdump emits them for sign-extended
+    /// constants). They should round-trip through i64→u32 cast intact —
+    /// matches what the C/Go ports do for `bpfs[3].k` in
+    /// `parse_realistic_filter`.
+    #[test]
+    fn parse_negative_constants_in_body() {
+        let bpfs = ok("1\n21 0 2 -1442840319");
+        assert_eq!(bpfs.len(), 1);
+        // (-1442840319) as i64 as u32 wraps to 2852126977.
+        assert_eq!(bpfs[0].k, (-1442840319i64) as u32);
+    }
+
+    /// A real `tcpdump -ddd "host 169.254.1.1"` would produce a non-zero
+    /// instruction count whose final BPF op is the accept (k=65535) or
+    /// reject (k=0) return. Confirm our parser preserves the program
+    /// faithfully — the kernel cares about every byte.
+    #[test]
+    fn parse_preserves_program_bytes_exactly() {
+        let input = "3\n40 0 0 12\n21 0 1 2048\n6 0 0 65535";
+        let bpfs = ok(input);
+        assert_eq!(bpfs.len(), 3);
+        assert_eq!(bpfs[0].code, 40);
+        assert_eq!(bpfs[0].k, 12);
+        assert_eq!(bpfs[1].code, 21);
+        assert_eq!(bpfs[1].jt, 0);
+        assert_eq!(bpfs[1].jf, 1);
+        assert_eq!(bpfs[1].k, 2048);
+        assert_eq!(bpfs[2].code, 6);
+        assert_eq!(bpfs[2].k, 65535);
+    }
 }

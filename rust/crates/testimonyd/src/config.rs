@@ -10,8 +10,11 @@ use std::path::Path;
 
 use crate::error::DaemonError;
 
+/// Mirrors the Go daemon's `SocketConfig` (`go/testimonyd/internal/socket/daemon.go:43-54`).
+/// Field set is identical; we deliberately do **not** use `deny_unknown_fields`
+/// because Go's JSON decoder accepts unknown fields silently — rejecting them
+/// here would break configs that worked under the legacy daemon.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct SocketConfig {
     #[serde(rename = "SocketName")]
     pub socket_name: String,
@@ -265,5 +268,129 @@ mod tests {
         let err = load(&nope).expect_err("missing file must error");
         let s = format!("{err}");
         assert!(s.contains(nope.to_str().expect("path str")), "expected path in {s:?}");
+    }
+
+    /// Match Go's `RunTestimony` (daemon.go:91-124): unknown JSON fields
+    /// are silently accepted (Go's json.Decoder does not deny by default).
+    /// A config with an extra "Comment" or future-field MUST still parse.
+    #[test]
+    fn load_accepts_unknown_fields_for_go_compat() {
+        let p = write_tmp(
+            "unknown_field",
+            r#"[{
+                "SocketName": "/tmp/foo",
+                "Interface": "eth0",
+                "BlockSize": 1024,
+                "NumBlocks": 16,
+                "BlockTimeoutMillis": 1000,
+                "FanoutSize": 1,
+                "Comment": "this field doesn't exist in the schema",
+                "FutureField": 42
+            }]"#,
+        );
+        let cfgs = load(&p).expect("must accept unknown fields");
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].socket_name, "/tmp/foo");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Empty array is valid JSON but the daemon refuses to start with no
+    /// sockets (server::run does this). The config loader itself accepts.
+    #[test]
+    fn load_accepts_empty_array() {
+        let p = write_tmp("empty", "[]");
+        let cfgs = load(&p).expect("empty array parses");
+        assert!(cfgs.is_empty());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// Multiple sockets in one config — each validated independently.
+    #[test]
+    fn load_validates_each_socket_independently() {
+        let p = write_tmp(
+            "multi_one_bad",
+            r#"[
+                {
+                    "SocketName": "/tmp/a",
+                    "Interface": "eth0",
+                    "BlockSize": 1024,
+                    "NumBlocks": 16,
+                    "BlockTimeoutMillis": 1000,
+                    "FanoutSize": 1
+                },
+                {
+                    "SocketName": "/tmp/b",
+                    "Interface": "eth1",
+                    "BlockSize": 0,
+                    "NumBlocks": 16,
+                    "BlockTimeoutMillis": 1000,
+                    "FanoutSize": 1
+                }
+            ]"#,
+        );
+        let err = load(&p).expect_err("second socket has BlockSize=0");
+        let s = format!("{err}");
+        assert!(s.contains("/tmp/b"), "error mentions failing socket: {s:?}");
+        assert!(s.contains("BlockSize"), "error mentions BlockSize: {s:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// FanoutID at boundary u16::MAX is accepted (kernel takes any 32-bit
+    /// integer for PACKET_FANOUT, but the Rust port narrows to u16 to
+    /// avoid type-confusion bugs).
+    #[test]
+    fn fanout_ids_max_u16_accepted() {
+        let v = vec![cfg(u16::MAX)];
+        let out = assign_fanout_ids(&v).expect("max u16 accepted");
+        assert_eq!(out, vec![u16::MAX]);
+    }
+
+    /// All ID slots taken AND auto-assignment requested → FanoutIdsExhausted.
+    /// Hard to construct without 65535 configs, but we can prove the
+    /// boundary case: claim u16::MAX-1 and u16::MAX, then auto.
+    #[test]
+    fn fanout_ids_auto_skips_max_taken() {
+        let v = vec![cfg(u16::MAX - 1), cfg(u16::MAX), cfg(0)];
+        let out = assign_fanout_ids(&v).expect("auto picks 1");
+        assert_eq!(out, vec![u16::MAX - 1, u16::MAX, 1]);
+    }
+
+    /// Invalid JSON → ConfigParse error with path.
+    #[test]
+    fn load_rejects_invalid_json() {
+        let p = write_tmp("bad_json", "{ this is not json");
+        let err = load(&p).expect_err("invalid json must error");
+        let s = format!("{err}");
+        assert!(s.contains(p.to_str().expect("path")), "path in error: {s:?}");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// JSON with wrong type (number instead of array) → ConfigParse.
+    #[test]
+    fn load_rejects_non_array_json() {
+        let p = write_tmp("non_array", "42");
+        let err = load(&p).expect_err("non-array must error");
+        assert!(matches!(err, DaemonError::ConfigParse { .. }));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    /// `BlockTimeoutMillis: 0` is allowed (kernel uses default). Match Go
+    /// behaviour: Go validates nothing, just passes the value through.
+    #[test]
+    fn load_accepts_zero_block_timeout() {
+        let p = write_tmp(
+            "zero_timeout",
+            r#"[{
+                "SocketName": "/tmp/foo",
+                "Interface": "eth0",
+                "BlockSize": 1024,
+                "NumBlocks": 16,
+                "BlockTimeoutMillis": 0,
+                "FanoutSize": 1
+            }]"#,
+        );
+        let cfgs = load(&p).expect("zero timeout permitted");
+        assert_eq!(cfgs[0].block_timeout_millis, 0);
+        let _ = std::fs::remove_file(&p);
     }
 }

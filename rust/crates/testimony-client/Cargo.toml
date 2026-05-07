@@ -16,3 +16,14 @@ testimony-protocol.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 log.workspace = true
+
+# Manual A/B perf harness for the buffered-recv hot path. Linux-only
+# because it pokes `libc::recv` directly. Run with:
+#   cargo build --release -p testimony-client --benches
+#   ./target/release/deps/recv_throughput-XXXX
+[[bench]]
+name = "recv_throughput"
+path = "benches/recv_throughput.rs"
+harness = false
+test = false
+bench = false

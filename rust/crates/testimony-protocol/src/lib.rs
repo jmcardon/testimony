@@ -244,4 +244,104 @@ mod tests {
         let tl = to_tl(TYPE_FANOUT_INDEX, 4).to_be_bytes();
         assert_eq!(tl, [0xC0, 0x07, 0x00, 0x04]);
     }
+
+    /// Mirror Go's `protocol.TypeOf` (`go/protocol/protocol.go:59-69`)
+    /// for every defined sentinel: SOX→Error, COX→Error, ERR→Error.
+    /// Sentinels classify as Error because the strict `>` boundary
+    /// excludes them; this is by design and Go does the same.
+    #[test]
+    fn sentinels_classify_as_error_just_like_go() {
+        // 0x8001 (TypeServerToClient sentinel) and 0xC006 (TypeClientToServer)
+        // and 0xFFFF (TypeError) all return Error per the Go logic.
+        for sentinel in [TYPE_SERVER_TO_CLIENT, TYPE_CLIENT_TO_SERVER, TYPE_ERROR] {
+            assert_eq!(category_of(sentinel), Category::Error, "{sentinel:#x}");
+        }
+    }
+
+    /// Boundary right above ServerToClient sentinel: still ServerToClient.
+    #[test]
+    fn just_above_sc_sentinel_is_sc() {
+        assert_eq!(category_of(0x8002), Category::ServerToClient);
+    }
+
+    /// Boundary right below ClientToServer sentinel: still ServerToClient.
+    /// (The "gap" between 0x8005 and 0xC006 inclusive is treated as SC by
+    /// the strict-less-than check.)
+    #[test]
+    fn just_below_cs_sentinel_is_sc() {
+        assert_eq!(category_of(0xC005), Category::ServerToClient);
+    }
+
+    /// Boundary right above ClientToServer sentinel: ClientToServer.
+    #[test]
+    fn just_above_cs_sentinel_is_cs() {
+        assert_eq!(category_of(0xC007), Category::ClientToServer);
+    }
+
+    /// Boundary right below TypeError: ClientToServer.
+    #[test]
+    fn just_below_error_is_cs() {
+        assert_eq!(category_of(0xFFFE), Category::ClientToServer);
+    }
+
+    /// `to_tl` then `tl_from` round-trips for every defined ServerToClient
+    /// type at the exact length the daemon uses (4 for u32 TLVs, 0 for
+    /// WaitingForFanoutIndex).
+    #[test]
+    fn round_trip_all_named_types() {
+        let cases: &[(u16, u16)] = &[
+            (TYPE_FANOUT_SIZE, 4),
+            (TYPE_BLOCK_SIZE, 4),
+            (TYPE_NUM_BLOCKS, 4),
+            (TYPE_WAITING_FOR_FANOUT_INDEX, 0),
+            (TYPE_FANOUT_INDEX, 4),
+        ];
+        for &(typ, len) in cases {
+            let raw = to_tl(typ, len);
+            let (got_typ, got_len) = tl_from(raw);
+            assert_eq!(got_typ, typ, "type round-trip");
+            assert_eq!(got_len, len, "length round-trip");
+        }
+    }
+
+    /// A bare block index of 0 (the very first block) does NOT have the
+    /// high bit set and so is classified as BlockIndex with length 0.
+    /// Important: a bogus client sending all zeros should be parsed as
+    /// "return block 0", not as a malformed TLV.
+    #[test]
+    fn zero_is_block_index_zero() {
+        let raw = 0u32;
+        let (typ, len) = tl_from(raw);
+        assert_eq!(typ, TYPE_BLOCK_INDEX);
+        assert_eq!(len, 0);
+        assert_eq!(category_of(typ), Category::BlockIndex);
+    }
+
+    /// All bits set is TypeError with length 0xFFFF — the worst-case
+    /// type. Make sure we don't accidentally classify it as something
+    /// useful.
+    #[test]
+    fn all_ones_is_error_with_max_length() {
+        let raw = 0xFFFF_FFFFu32;
+        let (typ, len) = tl_from(raw);
+        assert_eq!(typ, 0xFFFF);
+        assert_eq!(len, 0xFFFF);
+        assert_eq!(category_of(typ), Category::Error);
+    }
+
+    /// to_tl with length 0 produces the exact bytes for an empty TLV.
+    #[test]
+    fn to_tl_zero_length() {
+        let raw = to_tl(TYPE_WAITING_FOR_FANOUT_INDEX, 0);
+        assert_eq!(raw, 0x8002_0000);
+    }
+
+    /// Verify the TYPE_WAITING_FOR_FANOUT_INDEX wire form matches the
+    /// exact bytes the daemon sends to mark the end of handshake.
+    #[test]
+    fn waiting_for_fanout_index_wire_form() {
+        let raw = to_tl(TYPE_WAITING_FOR_FANOUT_INDEX, 0);
+        let bytes = raw.to_be_bytes();
+        assert_eq!(bytes, [0x80, 0x02, 0x00, 0x00]);
+    }
 }
